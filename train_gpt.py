@@ -62,6 +62,7 @@ class Hyperparameters:
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
     num_layers = int(os.environ.get("NUM_LAYERS", 9))
+    num_unique_blocks = int(os.environ.get("NUM_UNIQUE_BLOCKS", str(num_layers)))
     num_kv_heads = int(os.environ.get("NUM_KV_HEADS", 4))
     model_dim = int(os.environ.get("MODEL_DIM", 512))
     num_heads = int(os.environ.get("NUM_HEADS", 8))
@@ -650,6 +651,7 @@ class GPT(nn.Module):
         self,
         vocab_size: int,
         num_layers: int,
+        num_unique_blocks: int,
         model_dim: int,
         num_heads: int,
         num_kv_heads: int,
@@ -666,7 +668,13 @@ class GPT(nn.Module):
         self.tie_embeddings = tie_embeddings
         self.tied_embed_init_std = tied_embed_init_std
         self.logit_softcap = logit_softcap
+        if not (1 <= num_unique_blocks <= num_layers):
+            raise ValueError(
+                f"num_unique_blocks must be in [1, num_layers], got {num_unique_blocks} for num_layers={num_layers}"
+            )
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
+        self.num_layers = num_layers
+        self.num_unique_blocks = num_unique_blocks
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
@@ -681,9 +689,10 @@ class GPT(nn.Module):
                     rope_base,
                     qk_gain_init,
                 )
-                for i in range(num_layers)
+                for i in range(num_unique_blocks)
             ]
         )
+        self.block_layer_map = tuple(i % self.num_unique_blocks for i in range(self.num_layers))
         self.final_norm = RMSNorm()
         self.lm_head = None if tie_embeddings else CastedLinear(model_dim, vocab_size, bias=False)
         if self.lm_head is not None:
@@ -705,12 +714,13 @@ class GPT(nn.Module):
 
         # First half stores skips; second half reuses them in reverse order.
         for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
+            x = self.blocks[self.block_layer_map[i]](x, x0)
             skips.append(x)
         for i in range(self.num_decoder_layers):
             if skips:
                 x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+            layer_idx = self.num_encoder_layers + i
+            x = self.blocks[self.block_layer_map[layer_idx]](x, x0)
 
         x = self.final_norm(x).reshape(-1, x.size(-1))
         targets = target_ids.reshape(-1)
@@ -826,6 +836,7 @@ def main() -> None:
     base_model = GPT(
         vocab_size=args.vocab_size,
         num_layers=args.num_layers,
+        num_unique_blocks=args.num_unique_blocks,
         model_dim=args.model_dim,
         num_heads=args.num_heads,
         num_kv_heads=args.num_kv_heads,
@@ -894,6 +905,7 @@ def main() -> None:
 
     n_params = sum(p.numel() for p in base_model.parameters())
     log0(f"model_params:{n_params}")
+    log0(f"unique_blocks:{base_model.num_unique_blocks}")
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
