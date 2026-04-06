@@ -1,11 +1,41 @@
-data/tokenizers
+# Python
 __pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Virtual env
+.venv/
+venv/
+
+# System
 .DS_Store
-modded-nanogpt/
-modded-nanogpt
-data/datasets
+
+# Project data
+data/datasets/
+data/tokenizers/
 data/manifest.json
 data/docs_selected.jsonl
-.mypy_cache/
-.venv
+
+# Logs
 logs/
+*.log
+
+# Model artifacts (important)
+final_model.pt
+final_model.int8.ptz
+*.pt
+*.ptz
+*.bin
+
+# Temp / checkpoints
+checkpoints/
+*.ckpt
+
+# Caches
+.mypy_cache/
+.cache/
+
+# External repos
+modded-nanogpt/
+modded-nanogpt
