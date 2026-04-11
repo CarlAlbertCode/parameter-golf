@@ -9,6 +9,7 @@ from __future__ import annotations
 import copy
 from contextlib import contextmanager, nullcontext
 import glob
+import importlib
 import io
 import math
 import os
@@ -22,12 +23,16 @@ from pathlib import Path
 from typing import Any, Iterator, cast
 
 import numpy as np
-import sentencepiece as spm
 import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 from torch import Tensor, nn
 from torch.nn.parallel import DistributedDataParallel as DDP
+
+try:
+    import sentencepiece as spm
+except ImportError:
+    spm = None
 
 # -----------------------------
 # HYPERPARAMETERS
@@ -44,6 +49,10 @@ class Hyperparameters:
     train_files = os.path.join(data_path, "fineweb_train_*.bin")
     val_files = os.path.join(data_path, "fineweb_val_*.bin")
     tokenizer_path = os.environ.get("TOKENIZER_PATH", "./data/tokenizers/fineweb_1024_bpe.model")
+    tokenizer_type = os.environ.get(
+        "TOKENIZER_TYPE",
+        "bpe" if tokenizer_path.endswith(".json") else "sp",
+    )
     run_id = os.environ.get("RUN_ID", str(uuid.uuid4()))
     seed = int(os.environ.get("SEED", 1337))
 
@@ -77,6 +86,7 @@ class Hyperparameters:
     skip_gate_init = float(os.environ.get("SKIP_GATE_INIT", 4.0))
     diag_enable = bool(int(os.environ.get("DIAG_ENABLE", "1")))
     diag_max_layers = int(os.environ.get("DIAG_MAX_LAYERS", 6))
+    enable_kv_adapt = bool(int(os.environ.get("ENABLE_KV_ADAPT", "0")))
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
@@ -196,9 +206,7 @@ class Muon(torch.optim.Optimizer):
 # We calculate BPB (bits-per-byte) instead of validation loss, so we need methods to count the number of bits per token in the tokenizer.
 # Note: Submissions that edit the tokenizer will be examined more carefully, since screwing this up might unjustly improve your score.
 
-def build_sentencepiece_luts(
-    sp: spm.SentencePieceProcessor, vocab_size: int, device: torch.device
-) -> tuple[Tensor, Tensor, Tensor]:
+def build_sentencepiece_luts(sp: Any, vocab_size: int, device: torch.device) -> tuple[Tensor, Tensor, Tensor]:
     sp_any = cast(Any, sp)
     sp_vocab_size = int(sp.vocab_size())
     table_size = max(sp_vocab_size, vocab_size)
@@ -222,6 +230,192 @@ def build_sentencepiece_luts(
         torch.tensor(has_leading_space_np, dtype=torch.bool, device=device),
         torch.tensor(is_boundary_token_np, dtype=torch.bool, device=device),
     )
+
+
+def build_byte_to_unicode() -> dict[int, str]:
+    bs = list(range(ord("!"), ord("~") + 1)) + list(range(ord("¡"), ord("¬") + 1)) + list(range(ord("®"), ord("ÿ") + 1))
+    cs = bs[:]
+    n = 0
+    for b in range(256):
+        if b not in bs:
+            bs.append(b)
+            cs.append(256 + n)
+            n += 1
+    return dict(zip(bs, (chr(c) for c in cs), strict=True))
+
+
+BYTE_TO_UNICODE = build_byte_to_unicode()
+UNICODE_TO_BYTE = {v: k for k, v in BYTE_TO_UNICODE.items()}
+
+
+def bytelevel_piece_nbytes(piece: str) -> int:
+    return len(bytes(UNICODE_TO_BYTE[ch] for ch in piece))
+
+
+class RuntimeTokenizer:
+    tokenizer_type: str
+    vocab_size: int
+
+    def encode(self, text: str) -> list[int]:
+        raise NotImplementedError
+
+    def encode_batch(self, texts: list[str]) -> list[list[int]]:
+        raise NotImplementedError
+
+    def decode(self, token_ids: list[int]) -> str:
+        raise NotImplementedError
+
+    def decode_batch(self, batch_token_ids: list[list[int]]) -> list[str]:
+        raise NotImplementedError
+
+    def encode_to_tensor(self, text: str, *, device: torch.device | None = None) -> Tensor:
+        return torch.tensor(self.encode(text), dtype=torch.int64, device=device)
+
+    def encode_batch_to_tensor(
+        self,
+        texts: list[str],
+        *,
+        pad_value: int = 0,
+        device: torch.device | None = None,
+    ) -> tuple[Tensor, Tensor]:
+        encoded = self.encode_batch(texts)
+        lengths = torch.tensor([len(ids) for ids in encoded], dtype=torch.int64, device=device)
+        max_len = int(lengths.max().item()) if encoded else 0
+        batch = torch.full((len(encoded), max_len), pad_value, dtype=torch.int64, device=device)
+        for row_idx, ids in enumerate(encoded):
+            if not ids:
+                continue
+            batch[row_idx, : len(ids)] = torch.tensor(ids, dtype=torch.int64, device=device)
+        return batch, lengths
+
+    def decode_tensor(self, token_ids: Tensor, lengths: Tensor | None = None) -> str | list[str]:
+        token_ids = token_ids.detach().cpu().to(dtype=torch.int64)
+        if token_ids.ndim == 1:
+            return self.decode(token_ids.tolist())
+        if token_ids.ndim != 2:
+            raise ValueError(f"decode_tensor expects rank-1 or rank-2 tensor, got shape={tuple(token_ids.shape)}")
+        batch_ids: list[list[int]] = []
+        if lengths is None:
+            batch_ids = token_ids.tolist()
+        else:
+            lengths = lengths.detach().cpu().to(dtype=torch.int64)
+            if lengths.ndim != 1 or lengths.numel() != token_ids.size(0):
+                raise ValueError(
+                    "decode_tensor lengths must be rank-1 and match batch size, "
+                    f"got lengths_shape={tuple(lengths.shape)} batch={token_ids.size(0)}"
+                )
+            for row, length in zip(token_ids, lengths.tolist(), strict=True):
+                batch_ids.append(row[:length].tolist())
+        return self.decode_batch(batch_ids)
+
+
+class SentencePieceRuntimeTokenizer(RuntimeTokenizer):
+    def __init__(self, tokenizer_path: str):
+        if spm is None:
+            raise ImportError("sentencepiece is required for TOKENIZER_TYPE=sp")
+        self._sp = spm.SentencePieceProcessor()
+        cast(Any, self._sp).Load(tokenizer_path)
+        self.tokenizer_type = "sp"
+        self.vocab_size = int(self._sp.vocab_size())
+
+    @property
+    def sp_model(self) -> Any:
+        return self._sp
+
+    def encode(self, text: str) -> list[int]:
+        return list(cast(Any, self._sp).encode(text, out_type=int))
+
+    def encode_batch(self, texts: list[str]) -> list[list[int]]:
+        encoded = cast(Any, self._sp).encode(texts, out_type=int)
+        return [list(ids) for ids in cast(list[list[int]], encoded)]
+
+    def decode(self, token_ids: list[int]) -> str:
+        return cast(str, cast(Any, self._sp).decode(token_ids))
+
+    def decode_batch(self, batch_token_ids: list[list[int]]) -> list[str]:
+        decoded = cast(Any, self._sp).decode(batch_token_ids)
+        return [cast(str, text) for text in cast(list[str], decoded)]
+
+
+class ByteLevelBPETokenizer(RuntimeTokenizer):
+    def __init__(self, tokenizer_path: str):
+        try:
+            tokenizer_cls = importlib.import_module("tokenizers").Tokenizer
+        except ImportError as exc:
+            raise ImportError("tokenizers is required for TOKENIZER_TYPE=bpe") from exc
+        self._tokenizer = tokenizer_cls.from_file(tokenizer_path)
+        self.tokenizer_type = "bpe"
+        self.vocab_size = int(self._tokenizer.get_vocab_size(with_added_tokens=True))
+
+    @property
+    def tokenizer(self) -> Any:
+        return self._tokenizer
+
+    def encode(self, text: str) -> list[int]:
+        return list(self._tokenizer.encode(text).ids)
+
+    def encode_batch(self, texts: list[str]) -> list[list[int]]:
+        return [list(encoded.ids) for encoded in self._tokenizer.encode_batch(texts)]
+
+    def decode(self, token_ids: list[int]) -> str:
+        return cast(str, self._tokenizer.decode(token_ids, skip_special_tokens=False))
+
+    def decode_batch(self, batch_token_ids: list[list[int]]) -> list[str]:
+        return [
+            cast(str, text)
+            for text in self._tokenizer.decode_batch(batch_token_ids, skip_special_tokens=False)
+        ]
+
+
+def build_bytelevel_bpe_luts(
+    tokenizer: Any,
+    vocab_size: int,
+    device: torch.device,
+) -> tuple[Tensor, Tensor, Tensor]:
+    actual_vocab_size = int(tokenizer.get_vocab_size(with_added_tokens=True))
+    table_size = max(actual_vocab_size, vocab_size)
+    base_bytes_np = np.zeros((table_size,), dtype=np.int16)
+    has_leading_space_np = np.zeros((table_size,), dtype=np.bool_)
+    is_boundary_token_np = np.ones((table_size,), dtype=np.bool_)
+    special_ids = {
+        token_id
+        for token_id, added_token in cast(dict[int, Any], tokenizer.get_added_tokens_decoder()).items()
+        if bool(getattr(added_token, "special", False))
+    }
+    for token_id in range(actual_vocab_size):
+        if token_id in special_ids:
+            continue
+        piece = cast(str | None, tokenizer.id_to_token(token_id))
+        if piece is None:
+            continue
+        base_bytes_np[token_id] = bytelevel_piece_nbytes(piece)
+    return (
+        torch.tensor(base_bytes_np, dtype=torch.int16, device=device),
+        torch.tensor(has_leading_space_np, dtype=torch.bool, device=device),
+        torch.tensor(is_boundary_token_np, dtype=torch.bool, device=device),
+    )
+
+
+def resolve_tokenizer_path(tokenizer_type: str, tokenizer_path: str) -> Path:
+    path = Path(tokenizer_path).expanduser()
+    if tokenizer_type == "bpe":
+        if path.is_dir():
+            path = path / "tokenizer.json"
+        if path.suffix != ".json":
+            raise ValueError(f"TOKENIZER_TYPE=bpe expects tokenizer.json or its parent dir, got {tokenizer_path}")
+    elif tokenizer_type == "sp":
+        if path.suffix != ".model":
+            raise ValueError(f"TOKENIZER_TYPE=sp expects a SentencePiece .model file, got {tokenizer_path}")
+    else:
+        raise ValueError(f"TOKENIZER_TYPE must be 'bpe' or 'sp', got {tokenizer_type}")
+    return path
+
+
+def load_runtime_tokenizer(tokenizer_type: str, tokenizer_path: str) -> RuntimeTokenizer:
+    resolved_path = resolve_tokenizer_path(tokenizer_type, tokenizer_path)
+    if tokenizer_type == "bpe":
+        return ByteLevelBPETokenizer(str(resolved_path))
+    return SentencePieceRuntimeTokenizer(str(resolved_path))
 
 
 def load_validation_tokens(pattern: str, seq_len: int, max_tokens: int = 0) -> Tensor:
@@ -737,6 +931,11 @@ def uses_parallel_residual(parallel_residual_start: int, layer_idx: int) -> bool
     return parallel_residual_start >= 0 and layer_idx >= parallel_residual_start
 
 
+def detached_prefix_mean(x: Tensor) -> Tensor:
+    prefix_inv = torch.arange(1, x.size(2) + 1, device=x.device, dtype=torch.float32).reciprocal().to(dtype=x.dtype)
+    return torch.cumsum(x.detach(), dim=2) * prefix_inv.view(1, 1, -1, 1)
+
+
 class Rotary(nn.Module):
     # Caches cos/sin tables per sequence length on the current device.
     def __init__(self, dim: int, base: float = 10000.0):
@@ -777,6 +976,7 @@ class CausalSelfAttention(nn.Module):
         num_kv_heads: int,
         rope_base: float,
         qk_gain_init: float,
+        enable_kv_adapt: bool,
     ):
         super().__init__()
         if dim % num_heads != 0:
@@ -796,6 +996,9 @@ class CausalSelfAttention(nn.Module):
         self.proj.zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
         self.rotary = Rotary(self.head_dim, base=rope_base)
+        self.enable_kv_adapt = enable_kv_adapt
+        self.kv_adapt_scale_k = 0.125
+        self.kv_adapt_scale_v = 0.125
 
     def forward(self, x: Tensor) -> Tensor:
         bsz, seqlen, dim = x.shape
@@ -807,6 +1010,9 @@ class CausalSelfAttention(nn.Module):
         cos, sin = self.rotary(seqlen, x.device, q.dtype)
         q = apply_rotary_emb(q, cos, sin)
         k = apply_rotary_emb(k, cos, sin)
+        if self.enable_kv_adapt and not self.training:
+            k = k + self.kv_adapt_scale_k * detached_prefix_mean(k)
+            v = v + self.kv_adapt_scale_v * detached_prefix_mean(v)
         q = q * self.q_gain.to(dtype=q.dtype)[None, :, None, None]
         y = F.scaled_dot_product_attention(
             q,
@@ -847,11 +1053,12 @@ class Block(nn.Module):
         leaky_relu_slope: float,
         attn_scale_init: float,
         mlp_scale_init: float,
+        enable_kv_adapt: bool,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
+        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, enable_kv_adapt)
         self.mlp = MLP(dim, mlp_mult, leaky_relu_slope)
         self.attn_scale = nn.Parameter(torch.full((dim,), attn_scale_init, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.full((dim,), mlp_scale_init, dtype=torch.float32))
@@ -898,6 +1105,7 @@ class GPT(nn.Module):
         attn_scale_init: float,
         mlp_scale_init: float,
         skip_gate_init: float,
+        enable_kv_adapt: bool,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -930,6 +1138,7 @@ class GPT(nn.Module):
                     leaky_relu_slope,
                     attn_scale_init,
                     mlp_scale_init,
+                    enable_kv_adapt,
                 )
                 for i in range(num_layers)
             ]
@@ -995,11 +1204,21 @@ class GPT(nn.Module):
         return F.cross_entropy(logits.reshape(-1, logits.size(-1)).float(), targets, reduction="mean")
 
 
+def get_block(model: GPT, idx: int) -> Block:
+    return cast(Block, model.blocks[idx])
+
+
+def iter_blocks(model: GPT) -> Iterator[Block]:
+    for idx in range(len(model.blocks)):
+        yield get_block(model, idx)
+
+
 def collect_control_stats(model: GPT, log0) -> None:
-    attn_scales = torch.cat([block.attn_scale.detach().float().flatten().cpu() for block in model.blocks], dim=0)
-    mlp_scales = torch.cat([block.mlp_scale.detach().float().flatten().cpu() for block in model.blocks], dim=0)
-    q_gains = torch.cat([block.attn.q_gain.detach().float().flatten().cpu() for block in model.blocks], dim=0)
-    resid_mix = torch.cat([block.resid_mix.detach().float().flatten().cpu() for block in model.blocks], dim=0)
+    blocks = list(iter_blocks(model))
+    attn_scales = torch.cat([block.attn_scale.detach().float().flatten().cpu() for block in blocks], dim=0)
+    mlp_scales = torch.cat([block.mlp_scale.detach().float().flatten().cpu() for block in blocks], dim=0)
+    q_gains = torch.cat([block.attn.q_gain.detach().float().flatten().cpu() for block in blocks], dim=0)
+    resid_mix = torch.cat([block.resid_mix.detach().float().flatten().cpu() for block in blocks], dim=0)
     skip_weights = model.skip_weights.detach().float().flatten().cpu()
     skip_gates = torch.sigmoid(model.skip_gate_logits.detach().float()).flatten().cpu()
     log0(f"attn_scale_stats:{tensor_stats_str(attn_scales)}")
@@ -1075,22 +1294,24 @@ def run_model_diagnostics(model: GPT, input_ids: Tensor, log0, max_layers: int) 
 
     for i in range(model.num_encoder_layers):
         parallel_residual = uses_parallel_residual(model.parallel_residual_start, i)
+        block = get_block(model, i)
         if i in diag_layers:
-            x, x_in, attn_out, mlp_out = block_forward_with_stats(model.blocks[i], x, x0, parallel_residual)
+            x, x_in, attn_out, mlp_out = block_forward_with_stats(block, x, x0, parallel_residual)
             log0(
                 f"diag_block layer:{i} pass:encoder mode:{'parallel' if parallel_residual else 'sequential'} "
                 f"x_in:{tensor_stats_str(x_in)} attn_out:{tensor_stats_str(attn_out)} mlp_out:{tensor_stats_str(mlp_out)}"
             )
         else:
-            x = model.blocks[i](x, x0, parallel_residual=parallel_residual)
+            x = block(x, x0, parallel_residual=parallel_residual)
         skips.append(x)
 
     if model.recurrent_loops > 0:
         for loop_idx in range(model.recurrent_loops):
             for j in range(model.recurrent_layer_start, model.recurrent_layer_end):
                 parallel_residual = uses_parallel_residual(model.parallel_residual_start, j)
+                block = get_block(model, j)
                 if j in diag_layers and loop_idx == 0:
-                    x, x_in, attn_out, mlp_out = block_forward_with_stats(model.blocks[j], x, x0, parallel_residual)
+                    x, x_in, attn_out, mlp_out = block_forward_with_stats(block, x, x0, parallel_residual)
                     log0(
                         f"diag_block layer:{j} pass:recurrent loop:{loop_idx} "
                         f"mode:{'parallel' if parallel_residual else 'sequential'} "
@@ -1098,7 +1319,7 @@ def run_model_diagnostics(model: GPT, input_ids: Tensor, log0, max_layers: int) 
                         f"mlp_out:{tensor_stats_str(mlp_out)}"
                     )
                 else:
-                    x = model.blocks[j](x, x0, parallel_residual=parallel_residual)
+                    x = block(x, x0, parallel_residual=parallel_residual)
                 if j < model.num_encoder_layers:
                     recurrent_encoder_updates[j] = x
         for j, updated_skip in recurrent_encoder_updates.items():
@@ -1113,8 +1334,9 @@ def run_model_diagnostics(model: GPT, input_ids: Tensor, log0, max_layers: int) 
             skip_contrib = gate * model.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skip_source
             x = x + skip_contrib
         parallel_residual = uses_parallel_residual(model.parallel_residual_start, block_idx)
+        block = get_block(model, block_idx)
         if block_idx in diag_layers:
-            x, x_in, attn_out, mlp_out = block_forward_with_stats(model.blocks[block_idx], x, x0, parallel_residual)
+            x, x_in, attn_out, mlp_out = block_forward_with_stats(block, x, x0, parallel_residual)
             if skip_contrib is not None:
                 log0(f"diag_skip layer:{block_idx} pass:decoder contribution:{tensor_stats_str(skip_contrib)}")
             log0(
@@ -1122,7 +1344,7 @@ def run_model_diagnostics(model: GPT, input_ids: Tensor, log0, max_layers: int) 
                 f"x_in:{tensor_stats_str(x_in)} attn_out:{tensor_stats_str(attn_out)} mlp_out:{tensor_stats_str(mlp_out)}"
             )
         else:
-            x = model.blocks[block_idx](x, x0, parallel_residual=parallel_residual)
+            x = block(x, x0, parallel_residual=parallel_residual)
     logits = model.forward_logits(input_ids)
     ensure_finite("diag_logits", logits)
 
@@ -1206,6 +1428,8 @@ def main() -> None:
         raise ValueError(f"LEAKY_RELU_SLOPE must be >= 0, got {args.leaky_relu_slope}")
     if args.eval_stride < 0:
         raise ValueError(f"EVAL_STRIDE must be >= 0, got {args.eval_stride}")
+    if args.tokenizer_type not in {"bpe", "sp"}:
+        raise ValueError(f"TOKENIZER_TYPE must be 'bpe' or 'sp', got {args.tokenizer_type}")
     if args.val_max_tokens < 0:
         raise ValueError(f"VAL_MAX_TOKENS must be >= 0, got {args.val_max_tokens}")
     if args.parallel_residuals and args.parallel_residual_start < -1:
@@ -1296,21 +1520,29 @@ def main() -> None:
     torch.manual_seed(args.seed)
     torch.cuda.manual_seed_all(args.seed)
 
-    if not args.tokenizer_path.endswith(".model"):
-        raise ValueError(f"Script only setup for SentencePiece .model file: {args.tokenizer_path}")
-    sp = spm.SentencePieceProcessor()
-    cast(Any, sp).Load(args.tokenizer_path)
-    if int(sp.vocab_size()) != args.vocab_size:
+    runtime_tokenizer = load_runtime_tokenizer(args.tokenizer_type, args.tokenizer_path)
+    if runtime_tokenizer.vocab_size != args.vocab_size:
         raise ValueError(
-            f"VOCAB_SIZE={args.vocab_size} does not match tokenizer vocab_size={int(sp.vocab_size())}"
+            f"VOCAB_SIZE={args.vocab_size} does not match tokenizer vocab_size={runtime_tokenizer.vocab_size}"
         )
     dataset_dir = Path(args.data_path).resolve()
     actual_train_files = len(list(dataset_dir.glob("fineweb_train_*.bin")))
     val_tokens = load_validation_tokens(args.val_files, args.train_seq_len, args.val_max_tokens)
-    base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
-        sp, args.vocab_size, device
-    )
-    log0(f"val_bpb:enabled tokenizer_kind=sentencepiece tokenizer_path={args.tokenizer_path}")
+    if runtime_tokenizer.tokenizer_type == "bpe":
+        base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_bytelevel_bpe_luts(
+            cast(ByteLevelBPETokenizer, runtime_tokenizer).tokenizer,
+            args.vocab_size,
+            device,
+        )
+    else:
+        base_bytes_lut, has_leading_space_lut, is_boundary_token_lut = build_sentencepiece_luts(
+            cast(SentencePieceRuntimeTokenizer, runtime_tokenizer).sp_model,
+            args.vocab_size,
+            device,
+        )
+    resolved_tokenizer_path = resolve_tokenizer_path(args.tokenizer_type, args.tokenizer_path)
+    log0(f"tokenizer_type:{runtime_tokenizer.tokenizer_type} tokenizer_path:{resolved_tokenizer_path}")
+    log0(f"val_bpb:enabled tokenizer_kind={runtime_tokenizer.tokenizer_type} tokenizer_path={resolved_tokenizer_path}")
     log0(f"train_loader:dataset:{dataset_dir.name} train_shards:{actual_train_files}")
     log0(f"val_loader:shards pattern={args.val_files} tokens:{val_tokens.numel() - 1}")
     if args.val_max_tokens > 0:
@@ -1342,6 +1574,7 @@ def main() -> None:
         attn_scale_init=args.attn_scale_init,
         mlp_scale_init=args.mlp_scale_init,
         skip_gate_init=args.skip_gate_init,
+        enable_kv_adapt=args.enable_kv_adapt,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
@@ -1402,6 +1635,7 @@ def main() -> None:
     else:
         log0("bigram_hash:disabled")
     log0(f"activation:leaky_relu_sq slope:{args.leaky_relu_slope}")
+    log0(f"kv_adapt:{'enabled' if args.enable_kv_adapt else 'disabled'}")
     if args.recurrent_loops > 0:
         log0(
             f"recurrence:enabled start:{args.recurrent_layer_start} end:{args.recurrent_layer_end} "
