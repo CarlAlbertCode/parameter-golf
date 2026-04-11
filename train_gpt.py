@@ -70,6 +70,7 @@ class Hyperparameters:
     recurrent_layer_start = int(os.environ.get("RECURRENT_LAYER_START", -1))
     recurrent_layer_end = int(os.environ.get("RECURRENT_LAYER_END", -1))
     recurrent_loops = int(os.environ.get("RECURRENT_LOOPS", 0))
+    parallel_residuals = bool(int(os.environ.get("PARALLEL_RESIDUALS", "1")))
     parallel_residual_start = int(os.environ.get("PARALLEL_RESIDUAL_START", -1))
     attn_scale_init = float(os.environ.get("ATTN_SCALE_INIT", 0.5))
     mlp_scale_init = float(os.environ.get("MLP_SCALE_INIT", 0.5))
@@ -726,6 +727,16 @@ def tensor_stats_str(tensor: Tensor) -> str:
     return f"mean:{mean:.4f} std:{std:.4f} rms:{rms:.4f}"
 
 
+def normalize_parallel_residual_start(enabled: bool, start: int, num_layers: int) -> int:
+    if not enabled or start < 0 or start >= num_layers:
+        return -1
+    return start
+
+
+def uses_parallel_residual(parallel_residual_start: int, layer_idx: int) -> bool:
+    return parallel_residual_start >= 0 and layer_idx >= parallel_residual_start
+
+
 class Rotary(nn.Module):
     # Caches cos/sin tables per sequence length on the current device.
     def __init__(self, dim: int, base: float = 10000.0):
@@ -946,7 +957,7 @@ class GPT(nn.Module):
 
         # First half stores skips; second half reuses them in reverse order.
         for i in range(self.num_encoder_layers):
-            parallel_residual = self.parallel_residual_start >= 0 and i >= self.parallel_residual_start
+            parallel_residual = uses_parallel_residual(self.parallel_residual_start, i)
             x = self.blocks[i](x, x0, parallel_residual=parallel_residual)
             skips.append(x)
 
@@ -954,7 +965,7 @@ class GPT(nn.Module):
             recurrent_encoder_updates: dict[int, Tensor] = {}
             for _ in range(self.recurrent_loops):
                 for j in range(self.recurrent_layer_start, self.recurrent_layer_end):
-                    parallel_residual = self.parallel_residual_start >= 0 and j >= self.parallel_residual_start
+                    parallel_residual = uses_parallel_residual(self.parallel_residual_start, j)
                     x = self.blocks[j](x, x0, parallel_residual=parallel_residual)
                     if j < self.num_encoder_layers:
                         recurrent_encoder_updates[j] = x
@@ -966,7 +977,7 @@ class GPT(nn.Module):
                 gate = torch.sigmoid(self.skip_gate_logits[i]).to(dtype=x.dtype)[None, None, :]
                 x = x + gate * self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
             block_idx = self.num_encoder_layers + i
-            parallel_residual = self.parallel_residual_start >= 0 and block_idx >= self.parallel_residual_start
+            parallel_residual = uses_parallel_residual(self.parallel_residual_start, block_idx)
             x = self.blocks[block_idx](x, x0, parallel_residual=parallel_residual)
 
         x = self.final_norm(x)
@@ -1063,7 +1074,7 @@ def run_model_diagnostics(model: GPT, input_ids: Tensor, log0, max_layers: int) 
     recurrent_encoder_updates: dict[int, Tensor] = {}
 
     for i in range(model.num_encoder_layers):
-        parallel_residual = model.parallel_residual_start >= 0 and i >= model.parallel_residual_start
+        parallel_residual = uses_parallel_residual(model.parallel_residual_start, i)
         if i in diag_layers:
             x, x_in, attn_out, mlp_out = block_forward_with_stats(model.blocks[i], x, x0, parallel_residual)
             log0(
@@ -1077,7 +1088,7 @@ def run_model_diagnostics(model: GPT, input_ids: Tensor, log0, max_layers: int) 
     if model.recurrent_loops > 0:
         for loop_idx in range(model.recurrent_loops):
             for j in range(model.recurrent_layer_start, model.recurrent_layer_end):
-                parallel_residual = model.parallel_residual_start >= 0 and j >= model.parallel_residual_start
+                parallel_residual = uses_parallel_residual(model.parallel_residual_start, j)
                 if j in diag_layers and loop_idx == 0:
                     x, x_in, attn_out, mlp_out = block_forward_with_stats(model.blocks[j], x, x0, parallel_residual)
                     log0(
@@ -1101,7 +1112,7 @@ def run_model_diagnostics(model: GPT, input_ids: Tensor, log0, max_layers: int) 
             gate = torch.sigmoid(model.skip_gate_logits[i]).to(dtype=x.dtype)[None, None, :]
             skip_contrib = gate * model.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skip_source
             x = x + skip_contrib
-        parallel_residual = model.parallel_residual_start >= 0 and block_idx >= model.parallel_residual_start
+        parallel_residual = uses_parallel_residual(model.parallel_residual_start, block_idx)
         if block_idx in diag_layers:
             x, x_in, attn_out, mlp_out = block_forward_with_stats(model.blocks[block_idx], x, x0, parallel_residual)
             if skip_contrib is not None:
@@ -1184,6 +1195,11 @@ def main() -> None:
 
     code = Path(__file__).read_text(encoding="utf-8")
     args = Hyperparameters()
+    effective_parallel_residual_start = normalize_parallel_residual_start(
+        args.parallel_residuals,
+        args.parallel_residual_start,
+        args.num_layers,
+    )
     if not 0.0 <= args.ema_decay < 1.0:
         raise ValueError(f"EMA_DECAY must satisfy 0 <= EMA_DECAY < 1, got {args.ema_decay}")
     if args.leaky_relu_slope < 0.0:
@@ -1192,7 +1208,7 @@ def main() -> None:
         raise ValueError(f"EVAL_STRIDE must be >= 0, got {args.eval_stride}")
     if args.val_max_tokens < 0:
         raise ValueError(f"VAL_MAX_TOKENS must be >= 0, got {args.val_max_tokens}")
-    if args.parallel_residual_start < -1:
+    if args.parallel_residuals and args.parallel_residual_start < -1:
         raise ValueError(f"PARALLEL_RESIDUAL_START must be >= -1, got {args.parallel_residual_start}")
     if args.diag_max_layers < 0:
         raise ValueError(f"DIAG_MAX_LAYERS must be >= 0, got {args.diag_max_layers}")
@@ -1211,11 +1227,6 @@ def main() -> None:
                 f"got start={args.recurrent_layer_start} end={args.recurrent_layer_end} "
                 f"encoder_layers={args.num_layers // 2}"
             )
-    if args.parallel_residual_start >= args.num_layers:
-        raise ValueError(
-            f"PARALLEL_RESIDUAL_START must be < NUM_LAYERS when enabled, got "
-            f"{args.parallel_residual_start} vs num_layers={args.num_layers}"
-        )
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
@@ -1327,7 +1338,7 @@ def main() -> None:
         recurrent_layer_start=args.recurrent_layer_start,
         recurrent_layer_end=args.recurrent_layer_end,
         recurrent_loops=args.recurrent_loops,
-        parallel_residual_start=args.parallel_residual_start,
+        parallel_residual_start=effective_parallel_residual_start,
         attn_scale_init=args.attn_scale_init,
         mlp_scale_init=args.mlp_scale_init,
         skip_gate_init=args.skip_gate_init,
@@ -1398,11 +1409,15 @@ def main() -> None:
         )
     else:
         log0("recurrence:disabled")
-    if args.parallel_residual_start >= 0:
-        log0(f"parallel_residuals:enabled start:{args.parallel_residual_start}")
+    if effective_parallel_residual_start >= 0:
+        log0(f"parallel_residuals:enabled start:{effective_parallel_residual_start}")
     else:
         log0("parallel_residuals:disabled")
-    parallel_layers = list(range(args.parallel_residual_start, args.num_layers)) if args.parallel_residual_start >= 0 else []
+    parallel_layers = (
+        list(range(effective_parallel_residual_start, args.num_layers))
+        if effective_parallel_residual_start >= 0
+        else []
+    )
     encoder_parallel_layers = [layer for layer in parallel_layers if layer < base_model.num_encoder_layers]
     decoder_parallel_layers = [layer for layer in parallel_layers if layer >= base_model.num_encoder_layers]
     recurrent_layers = list(range(args.recurrent_layer_start, args.recurrent_layer_end)) if args.recurrent_loops > 0 else []
