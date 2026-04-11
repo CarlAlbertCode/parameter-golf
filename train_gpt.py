@@ -67,6 +67,15 @@ class Hyperparameters:
     leaky_relu_slope = float(os.environ.get("LEAKY_RELU_SLOPE", 0.5))
     eval_stride = int(os.environ.get("EVAL_STRIDE", 0))
     val_max_tokens = int(os.environ.get("VAL_MAX_TOKENS", 0))
+    recurrent_layer_start = int(os.environ.get("RECURRENT_LAYER_START", -1))
+    recurrent_layer_end = int(os.environ.get("RECURRENT_LAYER_END", -1))
+    recurrent_loops = int(os.environ.get("RECURRENT_LOOPS", 0))
+    parallel_residual_start = int(os.environ.get("PARALLEL_RESIDUAL_START", -1))
+    attn_scale_init = float(os.environ.get("ATTN_SCALE_INIT", 0.5))
+    mlp_scale_init = float(os.environ.get("MLP_SCALE_INIT", 0.5))
+    skip_gate_init = float(os.environ.get("SKIP_GATE_INIT", 4.0))
+    diag_enable = bool(int(os.environ.get("DIAG_ENABLE", "1")))
+    diag_max_layers = int(os.environ.get("DIAG_MAX_LAYERS", 6))
 
     # Model shape.
     vocab_size = int(os.environ.get("VOCAB_SIZE", 1024))
@@ -283,6 +292,7 @@ def eval_val(
             y = local[1:].reshape(-1, args.train_seq_len)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 batch_loss = model(x, y).detach()
+            ensure_finite("val_batch_loss", batch_loss)
             batch_token_count = float(y.numel())
             val_loss_sum += batch_loss.to(torch.float64) * batch_token_count
             val_token_count += batch_token_count
@@ -356,6 +366,7 @@ def eval_val_sliding(
                 y = local[1:].unsqueeze(0)
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                     logits = logits_model.forward_logits(x)
+                ensure_finite("val_logits", logits)
                 scored_logits = logits[:, -score_len:, :].reshape(-1, logits.size(-1))
                 scored_targets = y[:, -score_len:].reshape(-1)
                 val_loss_sum += F.cross_entropy(scored_logits.float(), scored_targets, reduction="sum").to(torch.float64)
@@ -392,7 +403,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,skip_gate,skip_gate_logits",
     ).split(",")
     if pattern
 )
@@ -700,6 +711,21 @@ def swapped_model_params(param_pairs: list[tuple[nn.Parameter, nn.Parameter]]) -
         swap_param_pairs_(param_pairs)
 
 
+def ensure_finite(name: str, tensor: Tensor) -> None:
+    if not torch.isfinite(tensor).all().item():
+        raise FloatingPointError(f"{name} contains NaN or Inf")
+
+
+def tensor_stats_str(tensor: Tensor) -> str:
+    t = tensor.detach().float()
+    if t.numel() == 0:
+        return "mean:0.0000 std:0.0000 rms:0.0000"
+    mean = t.mean().item()
+    std = t.std(unbiased=False).item()
+    rms = t.square().mean().sqrt().item()
+    return f"mean:{mean:.4f} std:{std:.4f} rms:{rms:.4f}"
+
+
 class Rotary(nn.Module):
     # Caches cos/sin tables per sequence length on the current device.
     def __init__(self, dim: int, base: float = 10000.0):
@@ -808,19 +834,29 @@ class Block(nn.Module):
         rope_base: float,
         qk_gain_init: float,
         leaky_relu_slope: float,
+        attn_scale_init: float,
+        mlp_scale_init: float,
     ):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
         self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init)
         self.mlp = MLP(dim, mlp_mult, leaky_relu_slope)
-        self.attn_scale = nn.Parameter(torch.full((dim,), 0.5, dtype=torch.float32))
-        self.mlp_scale = nn.Parameter(torch.full((dim,), 0.5, dtype=torch.float32))
+        self.attn_scale = nn.Parameter(torch.full((dim,), attn_scale_init, dtype=torch.float32))
+        self.mlp_scale = nn.Parameter(torch.full((dim,), mlp_scale_init, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
 
-    def forward(self, x: Tensor, x0: Tensor) -> Tensor:
+    def forward(self, x: Tensor, x0: Tensor, parallel_residual: bool = False) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+        if parallel_residual:
+            h_attn = self.attn_norm(x)
+            h_mlp = self.mlp_norm(x)
+            attn_out = self.attn(h_attn)
+            mlp_out = self.mlp(h_mlp)
+            x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
+            x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * mlp_out
+            return x
         attn_out = self.attn(self.attn_norm(x))
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
         x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
@@ -844,6 +880,13 @@ class GPT(nn.Module):
         leaky_relu_slope: float,
         bigram_vocab_size: int,
         bigram_dim: int,
+        recurrent_layer_start: int,
+        recurrent_layer_end: int,
+        recurrent_loops: int,
+        parallel_residual_start: int,
+        attn_scale_init: float,
+        mlp_scale_init: float,
+        skip_gate_init: float,
     ):
         super().__init__()
         if logit_softcap <= 0.0:
@@ -853,10 +896,17 @@ class GPT(nn.Module):
         self.logit_softcap = logit_softcap
         self.tok_emb = nn.Embedding(vocab_size, model_dim)
         self.bigram = BigramHashEmbedding(bigram_vocab_size, bigram_dim, model_dim) if bigram_vocab_size > 0 else None
+        self.recurrent_layer_start = recurrent_layer_start
+        self.recurrent_layer_end = recurrent_layer_end
+        self.recurrent_loops = recurrent_loops
+        self.parallel_residual_start = parallel_residual_start
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
+        self.skip_gate_logits = nn.Parameter(
+            torch.full((self.num_skip_weights, model_dim), skip_gate_init, dtype=torch.float32)
+        )
         self.blocks = nn.ModuleList(
             [
                 Block(
@@ -867,6 +917,8 @@ class GPT(nn.Module):
                     rope_base,
                     qk_gain_init,
                     leaky_relu_slope,
+                    attn_scale_init,
+                    mlp_scale_init,
                 )
                 for i in range(num_layers)
             ]
@@ -894,12 +946,28 @@ class GPT(nn.Module):
 
         # First half stores skips; second half reuses them in reverse order.
         for i in range(self.num_encoder_layers):
-            x = self.blocks[i](x, x0)
+            parallel_residual = self.parallel_residual_start >= 0 and i >= self.parallel_residual_start
+            x = self.blocks[i](x, x0, parallel_residual=parallel_residual)
             skips.append(x)
+
+        if self.recurrent_loops > 0:
+            recurrent_encoder_updates: dict[int, Tensor] = {}
+            for _ in range(self.recurrent_loops):
+                for j in range(self.recurrent_layer_start, self.recurrent_layer_end):
+                    parallel_residual = self.parallel_residual_start >= 0 and j >= self.parallel_residual_start
+                    x = self.blocks[j](x, x0, parallel_residual=parallel_residual)
+                    if j < self.num_encoder_layers:
+                        recurrent_encoder_updates[j] = x
+            for j, updated_skip in recurrent_encoder_updates.items():
+                skips[j] = updated_skip
+
         for i in range(self.num_decoder_layers):
             if skips:
-                x = x + self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
-            x = self.blocks[self.num_encoder_layers + i](x, x0)
+                gate = torch.sigmoid(self.skip_gate_logits[i]).to(dtype=x.dtype)[None, None, :]
+                x = x + gate * self.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skips.pop()
+            block_idx = self.num_encoder_layers + i
+            parallel_residual = self.parallel_residual_start >= 0 and block_idx >= self.parallel_residual_start
+            x = self.blocks[block_idx](x, x0, parallel_residual=parallel_residual)
 
         x = self.final_norm(x)
         if self.tie_embeddings:
@@ -914,6 +982,138 @@ class GPT(nn.Module):
         targets = target_ids.reshape(-1)
         logits = self.forward_logits(input_ids)
         return F.cross_entropy(logits.reshape(-1, logits.size(-1)).float(), targets, reduction="mean")
+
+
+def collect_control_stats(model: GPT, log0) -> None:
+    attn_scales = torch.cat([block.attn_scale.detach().float().flatten().cpu() for block in model.blocks], dim=0)
+    mlp_scales = torch.cat([block.mlp_scale.detach().float().flatten().cpu() for block in model.blocks], dim=0)
+    q_gains = torch.cat([block.attn.q_gain.detach().float().flatten().cpu() for block in model.blocks], dim=0)
+    resid_mix = torch.cat([block.resid_mix.detach().float().flatten().cpu() for block in model.blocks], dim=0)
+    skip_weights = model.skip_weights.detach().float().flatten().cpu()
+    skip_gates = torch.sigmoid(model.skip_gate_logits.detach().float()).flatten().cpu()
+    log0(f"attn_scale_stats:{tensor_stats_str(attn_scales)}")
+    log0(f"mlp_scale_stats:{tensor_stats_str(mlp_scales)}")
+    log0(f"q_gain_stats:{tensor_stats_str(q_gains)}")
+    log0(f"resid_mix_stats:{tensor_stats_str(resid_mix)}")
+    log0(f"skip_weight_stats:{tensor_stats_str(skip_weights)}")
+    log0(f"skip_gate_stats:{tensor_stats_str(skip_gates)}")
+    if model.bigram is not None:
+        log0(f"bigram_scale_stats:{tensor_stats_str(model.bigram.scale.detach().float().reshape(1).cpu())}")
+
+
+def selected_diag_layers(model: GPT, max_layers: int) -> list[int]:
+    candidates = [
+        0,
+        model.parallel_residual_start,
+        model.recurrent_layer_start,
+        model.recurrent_layer_end - 1,
+        model.num_encoder_layers - 1,
+        model.num_encoder_layers,
+        len(model.blocks) - 1,
+    ]
+    layers: list[int] = []
+    for layer in candidates:
+        if 0 <= layer < len(model.blocks) and layer not in layers:
+            layers.append(layer)
+    if max_layers <= 0 or len(layers) <= max_layers:
+        return layers
+    compressed = [layers[0]]
+    for layer in layers[1:]:
+        if len(compressed) >= max_layers - 1:
+            break
+        compressed.append(layer)
+    if layers[-1] not in compressed:
+        compressed.append(layers[-1])
+    return compressed[:max_layers]
+
+
+def block_forward_with_stats(
+    block: Block,
+    x: Tensor,
+    x0: Tensor,
+    parallel_residual: bool,
+) -> tuple[Tensor, Tensor, Tensor, Tensor]:
+    mix = block.resid_mix.to(dtype=x.dtype)
+    x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+    h_attn = block.attn_norm(x_in)
+    attn_out = block.attn(h_attn)
+    x_out = x_in + block.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
+    if parallel_residual:
+        mlp_out = block.mlp(block.mlp_norm(x_in))
+        x_out = x_out + block.mlp_scale.to(dtype=x.dtype)[None, None, :] * mlp_out
+        return x_out, x_in, attn_out, mlp_out
+    mlp_out = block.mlp(block.mlp_norm(x_out))
+    x_out = x_out + block.mlp_scale.to(dtype=x.dtype)[None, None, :] * mlp_out
+    return x_out, x_in, attn_out, mlp_out
+
+
+@torch.no_grad()
+def run_model_diagnostics(model: GPT, input_ids: Tensor, log0, max_layers: int) -> None:
+    if max_layers <= 0:
+        return
+    diag_layers = set(selected_diag_layers(model, max_layers))
+    x = model.tok_emb(input_ids)
+    if model.bigram is not None:
+        bigram_out = model.bigram(input_ids)
+        log0(f"diag_bigram:{tensor_stats_str(bigram_out)}")
+        x = x + bigram_out
+    x = F.rms_norm(x, (x.size(-1),))
+    x0 = x
+    skips: list[Tensor] = []
+    recurrent_encoder_updates: dict[int, Tensor] = {}
+
+    for i in range(model.num_encoder_layers):
+        parallel_residual = model.parallel_residual_start >= 0 and i >= model.parallel_residual_start
+        if i in diag_layers:
+            x, x_in, attn_out, mlp_out = block_forward_with_stats(model.blocks[i], x, x0, parallel_residual)
+            log0(
+                f"diag_block layer:{i} pass:encoder mode:{'parallel' if parallel_residual else 'sequential'} "
+                f"x_in:{tensor_stats_str(x_in)} attn_out:{tensor_stats_str(attn_out)} mlp_out:{tensor_stats_str(mlp_out)}"
+            )
+        else:
+            x = model.blocks[i](x, x0, parallel_residual=parallel_residual)
+        skips.append(x)
+
+    if model.recurrent_loops > 0:
+        for loop_idx in range(model.recurrent_loops):
+            for j in range(model.recurrent_layer_start, model.recurrent_layer_end):
+                parallel_residual = model.parallel_residual_start >= 0 and j >= model.parallel_residual_start
+                if j in diag_layers and loop_idx == 0:
+                    x, x_in, attn_out, mlp_out = block_forward_with_stats(model.blocks[j], x, x0, parallel_residual)
+                    log0(
+                        f"diag_block layer:{j} pass:recurrent loop:{loop_idx} "
+                        f"mode:{'parallel' if parallel_residual else 'sequential'} "
+                        f"x_in:{tensor_stats_str(x_in)} attn_out:{tensor_stats_str(attn_out)} "
+                        f"mlp_out:{tensor_stats_str(mlp_out)}"
+                    )
+                else:
+                    x = model.blocks[j](x, x0, parallel_residual=parallel_residual)
+                if j < model.num_encoder_layers:
+                    recurrent_encoder_updates[j] = x
+        for j, updated_skip in recurrent_encoder_updates.items():
+            skips[j] = updated_skip
+
+    for i in range(model.num_decoder_layers):
+        block_idx = model.num_encoder_layers + i
+        skip_contrib = None
+        if skips:
+            skip_source = skips.pop()
+            gate = torch.sigmoid(model.skip_gate_logits[i]).to(dtype=x.dtype)[None, None, :]
+            skip_contrib = gate * model.skip_weights[i].to(dtype=x.dtype)[None, None, :] * skip_source
+            x = x + skip_contrib
+        parallel_residual = model.parallel_residual_start >= 0 and block_idx >= model.parallel_residual_start
+        if block_idx in diag_layers:
+            x, x_in, attn_out, mlp_out = block_forward_with_stats(model.blocks[block_idx], x, x0, parallel_residual)
+            if skip_contrib is not None:
+                log0(f"diag_skip layer:{block_idx} pass:decoder contribution:{tensor_stats_str(skip_contrib)}")
+            log0(
+                f"diag_block layer:{block_idx} pass:decoder mode:{'parallel' if parallel_residual else 'sequential'} "
+                f"x_in:{tensor_stats_str(x_in)} attn_out:{tensor_stats_str(attn_out)} mlp_out:{tensor_stats_str(mlp_out)}"
+            )
+        else:
+            x = model.blocks[block_idx](x, x0, parallel_residual=parallel_residual)
+    logits = model.forward_logits(input_ids)
+    ensure_finite("diag_logits", logits)
 
 
 def split_optimizer_params(model: GPT) -> tuple[list[Tensor], list[Tensor], list[Tensor]]:
@@ -965,6 +1165,16 @@ def validate_optimizer_coverage(model: nn.Module, optimizers: list[torch.optim.O
         raise RuntimeError("Optimizer parameter coverage invalid: " + " ".join(problems))
 
 
+def validate_model_structure(model: GPT) -> None:
+    expected_shape = (model.num_skip_weights, model.tok_emb.embedding_dim)
+    if tuple(model.skip_weights.shape) != expected_shape:
+        raise ValueError(f"skip_weights shape mismatch: expected {expected_shape}, got {tuple(model.skip_weights.shape)}")
+    if tuple(model.skip_gate_logits.shape) != expected_shape:
+        raise ValueError(
+            f"skip_gate_logits shape mismatch: expected {expected_shape}, got {tuple(model.skip_gate_logits.shape)}"
+        )
+
+
 # -----------------------------
 # TRAINING
 # -----------------------------
@@ -982,6 +1192,30 @@ def main() -> None:
         raise ValueError(f"EVAL_STRIDE must be >= 0, got {args.eval_stride}")
     if args.val_max_tokens < 0:
         raise ValueError(f"VAL_MAX_TOKENS must be >= 0, got {args.val_max_tokens}")
+    if args.parallel_residual_start < -1:
+        raise ValueError(f"PARALLEL_RESIDUAL_START must be >= -1, got {args.parallel_residual_start}")
+    if args.diag_max_layers < 0:
+        raise ValueError(f"DIAG_MAX_LAYERS must be >= 0, got {args.diag_max_layers}")
+    if args.recurrent_loops < 0:
+        raise ValueError(f"RECURRENT_LOOPS must be >= 0, got {args.recurrent_loops}")
+    if args.recurrent_loops > 0:
+        if not (0 <= args.recurrent_layer_start < args.recurrent_layer_end <= args.num_layers):
+            raise ValueError(
+                "RECURRENT_LAYER_START and RECURRENT_LAYER_END must satisfy "
+                f"0 <= start < end <= NUM_LAYERS, got start={args.recurrent_layer_start} "
+                f"end={args.recurrent_layer_end} num_layers={args.num_layers}"
+            )
+        if args.recurrent_layer_start < args.num_layers // 2 < args.recurrent_layer_end:
+            raise ValueError(
+                "Recurrence range must not straddle the encoder/decoder boundary; "
+                f"got start={args.recurrent_layer_start} end={args.recurrent_layer_end} "
+                f"encoder_layers={args.num_layers // 2}"
+            )
+    if args.parallel_residual_start >= args.num_layers:
+        raise ValueError(
+            f"PARALLEL_RESIDUAL_START must be < NUM_LAYERS when enabled, got "
+            f"{args.parallel_residual_start} vs num_layers={args.num_layers}"
+        )
     zeropower_via_newtonschulz5 = torch.compile(zeropower_via_newtonschulz5)
 
     # -----------------------------
@@ -1090,11 +1324,19 @@ def main() -> None:
         leaky_relu_slope=args.leaky_relu_slope,
         bigram_vocab_size=args.bigram_vocab_size,
         bigram_dim=args.bigram_dim,
+        recurrent_layer_start=args.recurrent_layer_start,
+        recurrent_layer_end=args.recurrent_layer_end,
+        recurrent_loops=args.recurrent_loops,
+        parallel_residual_start=args.parallel_residual_start,
+        attn_scale_init=args.attn_scale_init,
+        mlp_scale_init=args.mlp_scale_init,
+        skip_gate_init=args.skip_gate_init,
     ).to(device).bfloat16()
     for module in base_model.modules():
         if isinstance(module, CastedLinear):
             module.float()
     restore_low_dim_params_to_fp32(base_model)
+    validate_model_structure(base_model)
     compiled_model: Any = torch.compile(base_model, dynamic=False, fullgraph=True)
     model: Any = DDP(compiled_model, device_ids=[local_rank], broadcast_buffers=False) if distributed else compiled_model
 
@@ -1149,8 +1391,29 @@ def main() -> None:
     else:
         log0("bigram_hash:disabled")
     log0(f"activation:leaky_relu_sq slope:{args.leaky_relu_slope}")
+    if args.recurrent_loops > 0:
+        log0(
+            f"recurrence:enabled start:{args.recurrent_layer_start} end:{args.recurrent_layer_end} "
+            f"loops:{args.recurrent_loops}"
+        )
+    else:
+        log0("recurrence:disabled")
+    if args.parallel_residual_start >= 0:
+        log0(f"parallel_residuals:enabled start:{args.parallel_residual_start}")
+    else:
+        log0("parallel_residuals:disabled")
+    parallel_layers = list(range(args.parallel_residual_start, args.num_layers)) if args.parallel_residual_start >= 0 else []
+    encoder_parallel_layers = [layer for layer in parallel_layers if layer < base_model.num_encoder_layers]
+    decoder_parallel_layers = [layer for layer in parallel_layers if layer >= base_model.num_encoder_layers]
+    recurrent_layers = list(range(args.recurrent_layer_start, args.recurrent_layer_end)) if args.recurrent_loops > 0 else []
+    log0(f"parallel_residual_layers encoder:{encoder_parallel_layers} decoder:{decoder_parallel_layers}")
+    log0(f"recurrent_layers:{recurrent_layers}")
     log0(f"ema:enabled decay:{args.ema_decay} use_for_eval:{int(args.use_ema_for_eval)}")
     log0(f"eval_stride:{args.eval_stride}")
+    log0(
+        f"residual_init attn_scale:{args.attn_scale_init} mlp_scale:{args.mlp_scale_init} "
+        f"skip_gate_logit:{args.skip_gate_init}"
+    )
     log0(
         f"tie_embeddings:{args.tie_embeddings} embed_lr:{token_lr} "
         f"head_lr:{args.head_lr if base_model.lm_head is not None else 0.0} "
@@ -1162,6 +1425,7 @@ def main() -> None:
         f"max_wallclock_seconds:{args.max_wallclock_seconds:.3f}"
     )
     log0(f"seed:{args.seed}")
+    collect_control_stats(base_model, log0)
 
     # -----------------------------
     # DATA LOADER & MODEL WARMUP
@@ -1213,6 +1477,13 @@ def main() -> None:
         if distributed:
             model.require_backward_grad_sync = True
         train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+
+    if args.diag_enable and args.diag_max_layers > 0:
+        diag_x, _ = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
+        run_model_diagnostics(base_model, diag_x[:1], log0, args.diag_max_layers)
+        train_loader = DistributedTokenLoader(args.train_files, rank, world_size, device)
+        if distributed:
+            dist.barrier()
 
     ema_model = copy.deepcopy(base_model)
     ema_model.requires_grad_(False)
@@ -1281,6 +1552,7 @@ def main() -> None:
             x, y = train_loader.next_batch(args.train_batch_tokens, args.train_seq_len, grad_accum_steps)
             with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                 loss = model(x, y)
+            ensure_finite(f"train_loss step={step} micro_step={micro_step}", loss.detach())
             train_loss += loss.detach()
             (loss * grad_scale).backward()
         train_loss /= grad_accum_steps
