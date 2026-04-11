@@ -68,7 +68,7 @@ class Hyperparameters:
     train_batch_tokens = int(os.environ.get("TRAIN_BATCH_TOKENS", 524_288))
     train_seq_len = int(os.environ.get("TRAIN_SEQ_LEN", 1024))
     max_wallclock_seconds = float(os.environ.get("MAX_WALLCLOCK_SECONDS", 600.0))
-    qk_gain_init = float(os.environ.get("QK_GAIN_INIT", 1.5))
+    qk_gain_init = float(os.environ.get("QK_GAIN", os.environ.get("QK_GAIN_INIT", 5.0)))
     bigram_vocab_size = int(os.environ.get("BIGRAM_VOCAB_SIZE", 0))
     bigram_dim = int(os.environ.get("BIGRAM_DIM", 128))
     ema_decay = float(os.environ.get("EMA_DECAY", 0.998))
@@ -113,7 +113,15 @@ class Hyperparameters:
     beta1 = float(os.environ.get("BETA1", 0.9))
     beta2 = float(os.environ.get("BETA2", 0.95))
     adam_eps = float(os.environ.get("ADAM_EPS", 1e-8))
-    grad_clip_norm = float(os.environ.get("GRAD_CLIP_NORM", 0.0))
+    sdclip_coef = float(os.environ.get("SDCLIP_COEF", 2.5))
+    ttt_enabled = bool(int(os.environ.get("TTT_ENABLED", "0")))
+    ttt_chunk_tokens = int(os.environ.get("TTT_CHUNK_TOKENS", 32768))
+    ttt_lr = float(os.environ.get("TTT_LR", 0.002))
+    ttt_epochs = int(os.environ.get("TTT_EPOCHS", 3))
+    ttt_momentum = float(os.environ.get("TTT_MOMENTUM", 0.9))
+    ttt_grad_clip = float(os.environ.get("TTT_GRAD_CLIP", 1.0))
+    ttt_freeze_blocks = int(os.environ.get("TTT_FREEZE_BLOCKS", 0))
+    ttt_batch_seqs = int(os.environ.get("TTT_BATCH_SEQS", 32))
 
 # -----------------------------
 # MUON OPTIMIZER 
@@ -445,6 +453,20 @@ def eval_val(
     has_leading_space_lut: Tensor,
     is_boundary_token_lut: Tensor,
 ) -> tuple[float, float]:
+    if args.ttt_enabled:
+        if args.eval_stride > 0:
+            raise ValueError("TTT_ENABLED=1 is not supported with EVAL_STRIDE>0")
+        return eval_val_ttt_score_first(
+            args,
+            cast(GPT, logits_model),
+            rank,
+            world_size,
+            device,
+            val_tokens,
+            base_bytes_lut,
+            has_leading_space_lut,
+            is_boundary_token_lut,
+        )
     if args.eval_stride > 0:
         return eval_val_sliding(
             args,
@@ -562,14 +584,20 @@ def eval_val_sliding(
                 with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
                     logits = logits_model.forward_logits(x)
                 ensure_finite("val_logits", logits)
-                scored_logits = logits[:, -score_len:, :].reshape(-1, logits.size(-1))
-                scored_targets = y[:, -score_len:].reshape(-1)
-                val_loss_sum += F.cross_entropy(scored_logits.float(), scored_targets, reduction="sum").to(torch.float64)
+                scored_logits = logits[:, -score_len:, :]
+                scored_targets = y[:, -score_len:]
+                assert_logits_targets_match("val_sliding", scored_logits, scored_targets)
+                val_loss_sum += F.cross_entropy(
+                    scored_logits.reshape(-1, scored_logits.size(-1)).float(),
+                    scored_targets.reshape(-1),
+                    reduction="sum",
+                ).to(torch.float64)
                 val_token_count += float(score_len)
                 prev_ids = x[:, -score_len:].reshape(-1)
-                token_bytes = base_bytes_lut[scored_targets].to(dtype=torch.int16)
+                tgt_ids = scored_targets.reshape(-1)
+                token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
                 token_bytes += (
-                    has_leading_space_lut[scored_targets] & ~is_boundary_token_lut[prev_ids]
+                    has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]
                 ).to(dtype=torch.int16)
                 val_byte_count += token_bytes.to(torch.float64).sum()
                 score_start = score_end
@@ -906,9 +934,47 @@ def swapped_model_params(param_pairs: list[tuple[nn.Parameter, nn.Parameter]]) -
         swap_param_pairs_(param_pairs)
 
 
+def clone_state_dict_to_cpu(model: nn.Module) -> dict[str, Tensor]:
+    return {name: tensor.detach().cpu().clone() for name, tensor in model.state_dict().items()}
+
+
+def snapshot_eval_state_dict(
+    model: nn.Module,
+    ema_param_pairs: list[tuple[nn.Parameter, nn.Parameter]],
+    use_ema_for_eval: bool,
+) -> dict[str, Tensor]:
+    context = swapped_model_params(ema_param_pairs) if use_ema_for_eval else nullcontext()
+    with context:
+        return clone_state_dict_to_cpu(model)
+
+
 def ensure_finite(name: str, tensor: Tensor) -> None:
     if not torch.isfinite(tensor).all().item():
         raise FloatingPointError(f"{name} contains NaN or Inf")
+
+
+def assert_logits_targets_match(name: str, logits: Tensor, targets: Tensor) -> None:
+    if logits.ndim != targets.ndim + 1 or logits.shape[:-1] != targets.shape:
+        raise ValueError(
+            f"{name} logits/targets shape mismatch: logits={tuple(logits.shape)} targets={tuple(targets.shape)}"
+        )
+
+
+@torch.no_grad()
+def apply_sdclip_(parameters: Iterator[nn.Parameter], clip_coef: float) -> None:
+    if clip_coef <= 0.0:
+        return
+    for param in parameters:
+        grad = param.grad
+        if grad is None:
+            continue
+        std = grad.detach().float().std(unbiased=False)
+        if not torch.isfinite(std).item():
+            continue
+        limit = float((std + 1e-6).item()) * clip_coef
+        if limit <= 0.0:
+            continue
+        grad.clamp_(min=-limit, max=limit)
 
 
 def tensor_stats_str(tensor: Tensor) -> str:
@@ -1199,10 +1265,10 @@ class GPT(nn.Module):
         return self.logit_softcap * torch.tanh(logits_proj / self.logit_softcap)
 
     def forward(self, input_ids: Tensor, target_ids: Tensor) -> Tensor:
-        targets = target_ids.reshape(-1)
         logits = self.forward_logits(input_ids)
+        assert_logits_targets_match("gpt_forward", logits, target_ids)
+        targets = target_ids.reshape(-1)
         return F.cross_entropy(logits.reshape(-1, logits.size(-1)).float(), targets, reduction="mean")
-
 
 def get_block(model: GPT, idx: int) -> Block:
     return cast(Block, model.blocks[idx])
@@ -1211,6 +1277,156 @@ def get_block(model: GPT, idx: int) -> Block:
 def iter_blocks(model: GPT) -> Iterator[Block]:
     for idx in range(len(model.blocks)):
         yield get_block(model, idx)
+
+
+def get_ttt_trainable_params(model: GPT, freeze_blocks: int) -> list[nn.Parameter]:
+    if freeze_blocks <= 0:
+        return [param for param in model.parameters() if param.requires_grad]
+
+    params: list[nn.Parameter] = [cast(nn.Parameter, model.tok_emb.weight)]
+    params.extend(cast(Iterator[nn.Parameter], model.final_norm.parameters()))
+    for idx in range(freeze_blocks, len(model.blocks)):
+        params.extend(cast(Iterator[nn.Parameter], get_block(model, idx).parameters()))
+
+    unique_params: list[nn.Parameter] = []
+    seen: set[int] = set()
+    for param in params:
+        param_id = id(param)
+        if param_id in seen:
+            continue
+        seen.add(param_id)
+        unique_params.append(param)
+    return unique_params
+
+
+def score_ttt_chunk(
+    model: GPT,
+    chunk_tokens: Tensor,
+    seq_len: int,
+    base_bytes_lut: Tensor,
+    has_leading_space_lut: Tensor,
+    is_boundary_token_lut: Tensor,
+) -> tuple[Tensor, float, Tensor]:
+    x = chunk_tokens[:-1].reshape(-1, seq_len)
+    y = chunk_tokens[1:].reshape(-1, seq_len)
+    model.eval()
+    with torch.inference_mode():
+        with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+            logits = model.forward_logits(x)
+        ensure_finite("ttt_chunk_logits", logits)
+        assert_logits_targets_match("ttt_chunk_score", logits, y)
+        loss_sum = F.cross_entropy(logits.reshape(-1, logits.size(-1)).float(), y.reshape(-1), reduction="sum")
+        prev_ids = x.reshape(-1)
+        tgt_ids = y.reshape(-1)
+        token_bytes = base_bytes_lut[tgt_ids].to(dtype=torch.int16)
+        token_bytes += (has_leading_space_lut[tgt_ids] & ~is_boundary_token_lut[prev_ids]).to(dtype=torch.int16)
+        byte_count = token_bytes.to(torch.float64).sum()
+    return loss_sum.to(torch.float64), float(y.numel()), byte_count
+
+
+def train_ttt_chunk(
+    args: Hyperparameters,
+    model: GPT,
+    optimizer: torch.optim.SGD,
+    trainable_params: list[nn.Parameter],
+    chunk_tokens: Tensor,
+) -> None:
+    if args.ttt_epochs <= 0 or not trainable_params:
+        return
+
+    x = chunk_tokens[:-1].reshape(-1, args.train_seq_len)
+    y = chunk_tokens[1:].reshape(-1, args.train_seq_len)
+    model.train()
+    for _ in range(args.ttt_epochs):
+        for batch_seq_start in range(0, x.size(0), args.ttt_batch_seqs):
+            batch_seq_end = min(batch_seq_start + args.ttt_batch_seqs, x.size(0))
+            xb = x[batch_seq_start:batch_seq_end]
+            yb = y[batch_seq_start:batch_seq_end]
+            optimizer.zero_grad(set_to_none=True)
+            with torch.autocast(device_type="cuda", dtype=torch.bfloat16, enabled=True):
+                loss = model(xb, yb)
+            ensure_finite("ttt_train_loss", loss)
+            loss.backward()
+            if args.ttt_grad_clip > 0.0:
+                torch.nn.utils.clip_grad_norm_(trainable_params, args.ttt_grad_clip)
+            optimizer.step()
+    optimizer.zero_grad(set_to_none=True)
+
+
+def eval_val_ttt_score_first(
+    args: Hyperparameters,
+    model: GPT,
+    rank: int,
+    world_size: int,
+    device: torch.device,
+    val_tokens: Tensor,
+    base_bytes_lut: Tensor,
+    has_leading_space_lut: Tensor,
+    is_boundary_token_lut: Tensor,
+) -> tuple[float, float]:
+    total_seqs = (val_tokens.numel() - 1) // args.train_seq_len
+    seq_start = (total_seqs * rank) // world_size
+    seq_end = (total_seqs * (rank + 1)) // world_size
+    chunk_seqs = max(args.ttt_chunk_tokens // args.train_seq_len, 1)
+    trainable_params = get_ttt_trainable_params(model, args.ttt_freeze_blocks)
+    trainable_param_ids = {id(param) for param in trainable_params}
+    all_params = list(model.parameters())
+    original_requires_grad = [param.requires_grad for param in all_params]
+    saved_trainable_params = [param.detach().cpu().clone() for param in trainable_params]
+    val_loss_sum = torch.zeros((), device=device, dtype=torch.float64)
+    val_token_count = torch.zeros((), device=device, dtype=torch.float64)
+    val_byte_count = torch.zeros((), device=device, dtype=torch.float64)
+    optimizer = (
+        torch.optim.SGD(trainable_params, lr=args.ttt_lr, momentum=args.ttt_momentum)
+        if trainable_params and args.ttt_epochs > 0
+        else None
+    )
+
+    try:
+        for param in all_params:
+            param.requires_grad_(id(param) in trainable_param_ids)
+            param.grad = None
+
+        chunk_starts = list(range(seq_start, seq_end, chunk_seqs))
+        for chunk_idx, chunk_seq_start in enumerate(chunk_starts):
+            chunk_seq_end = min(chunk_seq_start + chunk_seqs, seq_end)
+            raw_start = chunk_seq_start * args.train_seq_len
+            raw_end = chunk_seq_end * args.train_seq_len + 1
+            chunk_tokens = val_tokens[raw_start:raw_end].to(device=device, dtype=torch.int64, non_blocking=True)
+            chunk_loss_sum, chunk_token_count, chunk_byte_count = score_ttt_chunk(
+                model,
+                chunk_tokens,
+                args.train_seq_len,
+                base_bytes_lut,
+                has_leading_space_lut,
+                is_boundary_token_lut,
+            )
+            val_loss_sum += chunk_loss_sum
+            val_token_count += chunk_token_count
+            val_byte_count += chunk_byte_count
+
+            if optimizer is not None and chunk_idx + 1 < len(chunk_starts):
+                train_ttt_chunk(args, model, optimizer, trainable_params, chunk_tokens)
+    finally:
+        if optimizer is not None:
+            optimizer.zero_grad(set_to_none=True)
+        with torch.no_grad():
+            for param, saved_param in zip(trainable_params, saved_trainable_params, strict=True):
+                param.copy_(saved_param.to(device=param.device, dtype=param.dtype))
+        for param, requires_grad in zip(all_params, original_requires_grad, strict=True):
+            param.requires_grad_(requires_grad)
+            param.grad = None
+        model.train()
+
+    if dist.is_available() and dist.is_initialized():
+        dist.all_reduce(val_loss_sum, op=dist.ReduceOp.SUM)
+        dist.all_reduce(val_token_count, op=dist.ReduceOp.SUM)
+        dist.all_reduce(val_byte_count, op=dist.ReduceOp.SUM)
+
+    val_loss = val_loss_sum / val_token_count
+    bits_per_token = val_loss.item() / math.log(2.0)
+    tokens_per_byte = val_token_count.item() / val_byte_count.item()
+    return float(val_loss.item()), float(bits_per_token * tokens_per_byte)
 
 
 def collect_control_stats(model: GPT, log0) -> None:
@@ -1430,6 +1646,25 @@ def main() -> None:
         raise ValueError(f"EVAL_STRIDE must be >= 0, got {args.eval_stride}")
     if args.tokenizer_type not in {"bpe", "sp"}:
         raise ValueError(f"TOKENIZER_TYPE must be 'bpe' or 'sp', got {args.tokenizer_type}")
+    if args.sdclip_coef < 0.0:
+        raise ValueError(f"SDCLIP_COEF must be >= 0, got {args.sdclip_coef}")
+    if args.ttt_lr < 0.0:
+        raise ValueError(f"TTT_LR must be >= 0, got {args.ttt_lr}")
+    if args.ttt_chunk_tokens <= 0:
+        raise ValueError(f"TTT_CHUNK_TOKENS must be > 0, got {args.ttt_chunk_tokens}")
+    if args.ttt_epochs < 0:
+        raise ValueError(f"TTT_EPOCHS must be >= 0, got {args.ttt_epochs}")
+    if args.ttt_momentum < 0.0:
+        raise ValueError(f"TTT_MOMENTUM must be >= 0, got {args.ttt_momentum}")
+    if args.ttt_grad_clip < 0.0:
+        raise ValueError(f"TTT_GRAD_CLIP must be >= 0, got {args.ttt_grad_clip}")
+    if not (0 <= args.ttt_freeze_blocks <= args.num_layers):
+        raise ValueError(
+            f"TTT_FREEZE_BLOCKS must satisfy 0 <= TTT_FREEZE_BLOCKS <= NUM_LAYERS, "
+            f"got freeze_blocks={args.ttt_freeze_blocks} num_layers={args.num_layers}"
+        )
+    if args.ttt_batch_seqs <= 0:
+        raise ValueError(f"TTT_BATCH_SEQS must be > 0, got {args.ttt_batch_seqs}")
     if args.val_max_tokens < 0:
         raise ValueError(f"VAL_MAX_TOKENS must be >= 0, got {args.val_max_tokens}")
     if args.parallel_residuals and args.parallel_residual_start < -1:
@@ -1815,8 +2050,7 @@ def main() -> None:
             for group in opt.param_groups:
                 group["lr"] = group["base_lr"] * scale
 
-        if args.grad_clip_norm > 0:
-            torch.nn.utils.clip_grad_norm_(base_model.parameters(), args.grad_clip_norm)
+        apply_sdclip_(base_model.parameters(), args.sdclip_coef)
         for opt in optimizers:
             opt.step()
         zero_grad_all()
@@ -1850,6 +2084,7 @@ def main() -> None:
     log0(f"train_step_avg_ms:{training_time_ms / max(step, 1):.2f}")
     if final_val_loss is not None and final_val_bpb is not None:
         log0(f"final_eval_exact val_loss:{final_val_loss:.8f} val_bpb:{final_val_bpb:.8f}")
+    export_state_dict = snapshot_eval_state_dict(base_model, ema_param_pairs, args.use_ema_for_eval)
 
     # -----------------------------
     # SERIALIZATION + ROUNDTRIP VALIDATION
@@ -1858,14 +2093,14 @@ def main() -> None:
     # the compressed int8+zlib artifact and validate the round-tripped weights.
 
     if master_process:
-        torch.save(base_model.state_dict(), "final_model.pt")
+        torch.save(export_state_dict, "final_model.pt")
         model_bytes = os.path.getsize("final_model.pt")
         code_bytes = len(code.encode("utf-8"))
         log0(f"Serialized model: {model_bytes} bytes")
         log0(f"Code size: {code_bytes} bytes")
         log0(f"Total submission size: {model_bytes + code_bytes} bytes")
 
-    quant_obj, quant_stats = quantize_state_dict_int8(base_model.state_dict())
+    quant_obj, quant_stats = quantize_state_dict_int8(export_state_dict)
     quant_buf = io.BytesIO()
     torch.save(quant_obj, quant_buf)
     quant_raw = quant_buf.getvalue()
