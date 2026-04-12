@@ -79,6 +79,9 @@ class Hyperparameters:
     recurrent_layer_start = int(os.environ.get("RECURRENT_LAYER_START", -1))
     recurrent_layer_end = int(os.environ.get("RECURRENT_LAYER_END", -1))
     recurrent_loops = int(os.environ.get("RECURRENT_LOOPS", 0))
+    recurrent_depth_conditioning = bool(int(os.environ.get("RECURRENT_DEPTH_CONDITIONING", "0")))
+    recurrent_depth_slots = int(os.environ.get("RECURRENT_DEPTH_SLOTS", 4))
+    recurrent_state_accum = bool(int(os.environ.get("RECURRENT_STATE_ACCUM", "0")))
     parallel_residuals = bool(int(os.environ.get("PARALLEL_RESIDUALS", "1")))
     parallel_residual_start = int(os.environ.get("PARALLEL_RESIDUAL_START", -1))
     attn_scale_init = float(os.environ.get("ATTN_SCALE_INIT", 0.5))
@@ -626,7 +629,7 @@ CONTROL_TENSOR_NAME_PATTERNS = tuple(
     pattern
     for pattern in os.environ.get(
         "CONTROL_TENSOR_NAME_PATTERNS",
-        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,skip_gate,skip_gate_logits",
+        "attn_scale,attn_scales,mlp_scale,mlp_scales,resid_mix,resid_mixes,q_gain,skip_weight,skip_weights,skip_gate,skip_gate_logits,recurrent_depth",
     ).split(",")
     if pattern
 )
@@ -1002,6 +1005,39 @@ def detached_prefix_mean(x: Tensor) -> Tensor:
     return torch.cumsum(x.detach(), dim=2) * prefix_inv.view(1, 1, -1, 1)
 
 
+def recurrent_depth_bias(
+    recurrent_depth_cond: nn.Parameter | None,
+    loop_idx: int,
+    dtype: torch.dtype,
+) -> Tensor | None:
+    if recurrent_depth_cond is None:
+        return None
+    depth_idx = min(loop_idx, recurrent_depth_cond.size(0) - 1)
+    return recurrent_depth_cond[depth_idx].to(dtype=dtype)[None, None, :]
+
+
+def inject_recurrent_state(
+    x: Tensor,
+    recurrent_state: Tensor | None,
+    recurrent_state_inject: nn.Parameter | None,
+) -> Tensor:
+    if recurrent_state is None or recurrent_state_inject is None:
+        return x
+    inject = torch.tanh(recurrent_state_inject).to(dtype=x.dtype)[None, None, :]
+    return x + inject * recurrent_state
+
+
+def update_recurrent_state(
+    recurrent_state: Tensor | None,
+    x: Tensor,
+    recurrent_state_mix: nn.Parameter | None,
+) -> Tensor | None:
+    if recurrent_state is None or recurrent_state_mix is None:
+        return recurrent_state
+    mix = torch.sigmoid(recurrent_state_mix).to(dtype=x.dtype)[None, None, :]
+    return torch.lerp(recurrent_state, x, mix)
+
+
 class Rotary(nn.Module):
     # Caches cos/sin tables per sequence length on the current device.
     def __init__(self, dim: int, base: float = 10000.0):
@@ -1167,6 +1203,9 @@ class GPT(nn.Module):
         recurrent_layer_start: int,
         recurrent_layer_end: int,
         recurrent_loops: int,
+        recurrent_depth_conditioning: bool,
+        recurrent_depth_slots: int,
+        recurrent_state_accum: bool,
         parallel_residual_start: int,
         attn_scale_init: float,
         mlp_scale_init: float,
@@ -1184,10 +1223,21 @@ class GPT(nn.Module):
         self.recurrent_layer_start = recurrent_layer_start
         self.recurrent_layer_end = recurrent_layer_end
         self.recurrent_loops = recurrent_loops
+        self.recurrent_depth_conditioning = recurrent_depth_conditioning
+        self.recurrent_depth_slots = recurrent_depth_slots
+        self.recurrent_state_accum = recurrent_state_accum
         self.parallel_residual_start = parallel_residual_start
         self.num_encoder_layers = num_layers // 2
         self.num_decoder_layers = num_layers - self.num_encoder_layers
         self.num_skip_weights = min(self.num_encoder_layers, self.num_decoder_layers)
+        self.recurrent_depth_cond: nn.Parameter | None = None
+        if recurrent_depth_conditioning:
+            self.recurrent_depth_cond = nn.Parameter(torch.zeros(recurrent_depth_slots, model_dim, dtype=torch.float32))
+        self.recurrent_state_inject: nn.Parameter | None = None
+        self.recurrent_state_mix: nn.Parameter | None = None
+        if recurrent_state_accum:
+            self.recurrent_state_inject = nn.Parameter(torch.zeros(model_dim, dtype=torch.float32))
+            self.recurrent_state_mix = nn.Parameter(torch.zeros(model_dim, dtype=torch.float32))
         self.skip_weights = nn.Parameter(torch.ones(self.num_skip_weights, model_dim, dtype=torch.float32))
         self.skip_gate_logits = nn.Parameter(
             torch.full((self.num_skip_weights, model_dim), skip_gate_init, dtype=torch.float32)
@@ -1222,6 +1272,13 @@ class GPT(nn.Module):
             if isinstance(module, nn.Linear) and getattr(module, "zero_init", False):
                 nn.init.zeros_(module.weight)
 
+    def recurrence_extra_param_count(self) -> int:
+        total = 0
+        for param in (self.recurrent_depth_cond, self.recurrent_state_inject, self.recurrent_state_mix):
+            if param is not None:
+                total += int(param.numel())
+        return total
+
     def forward_logits(self, input_ids: Tensor) -> Tensor:
         x = self.tok_emb(input_ids)
         if self.bigram is not None:
@@ -1238,10 +1295,18 @@ class GPT(nn.Module):
 
         if self.recurrent_loops > 0:
             recurrent_encoder_updates: dict[int, Tensor] = {}
-            for _ in range(self.recurrent_loops):
+            recurrent_state = x if self.recurrent_state_accum else None
+            for loop_idx in range(self.recurrent_loops):
                 for j in range(self.recurrent_layer_start, self.recurrent_layer_end):
                     parallel_residual = uses_parallel_residual(self.parallel_residual_start, j)
+                    depth_bias = recurrent_depth_bias(self.recurrent_depth_cond, loop_idx, x.dtype)
+                    if depth_bias is not None:
+                        x = x + depth_bias
+                    # Recurrent state is injected before each recurrent block and updated from the
+                    # post-block activations, so the state accumulates across the full recurrent unroll.
+                    x = inject_recurrent_state(x, recurrent_state, self.recurrent_state_inject)
                     x = self.blocks[j](x, x0, parallel_residual=parallel_residual)
+                    recurrent_state = update_recurrent_state(recurrent_state, x, self.recurrent_state_mix)
                     if j < self.num_encoder_layers:
                         recurrent_encoder_updates[j] = x
             for j, updated_skip in recurrent_encoder_updates.items():
@@ -1445,6 +1510,16 @@ def collect_control_stats(model: GPT, log0) -> None:
     log0(f"skip_gate_stats:{tensor_stats_str(skip_gates)}")
     if model.bigram is not None:
         log0(f"bigram_scale_stats:{tensor_stats_str(model.bigram.scale.detach().float().reshape(1).cpu())}")
+    if model.recurrent_depth_cond is not None:
+        log0(f"recurrent_depth_cond_stats:{tensor_stats_str(model.recurrent_depth_cond.detach().float().cpu())}")
+    if model.recurrent_state_inject is not None:
+        log0(
+            f"recurrent_state_inject_stats:{tensor_stats_str(torch.tanh(model.recurrent_state_inject.detach().float()).cpu())}"
+        )
+    if model.recurrent_state_mix is not None:
+        log0(
+            f"recurrent_state_mix_stats:{tensor_stats_str(torch.sigmoid(model.recurrent_state_mix.detach().float()).cpu())}"
+        )
 
 
 def selected_diag_layers(model: GPT, max_layers: int) -> list[int]:
@@ -1522,10 +1597,15 @@ def run_model_diagnostics(model: GPT, input_ids: Tensor, log0, max_layers: int) 
         skips.append(x)
 
     if model.recurrent_loops > 0:
+        recurrent_state = x if model.recurrent_state_accum else None
         for loop_idx in range(model.recurrent_loops):
             for j in range(model.recurrent_layer_start, model.recurrent_layer_end):
                 parallel_residual = uses_parallel_residual(model.parallel_residual_start, j)
                 block = get_block(model, j)
+                depth_bias = recurrent_depth_bias(model.recurrent_depth_cond, loop_idx, x.dtype)
+                if depth_bias is not None:
+                    x = x + depth_bias
+                x = inject_recurrent_state(x, recurrent_state, model.recurrent_state_inject)
                 if j in diag_layers and loop_idx == 0:
                     x, x_in, attn_out, mlp_out = block_forward_with_stats(block, x, x0, parallel_residual)
                     log0(
@@ -1536,6 +1616,7 @@ def run_model_diagnostics(model: GPT, input_ids: Tensor, log0, max_layers: int) 
                     )
                 else:
                     x = block(x, x0, parallel_residual=parallel_residual)
+                recurrent_state = update_recurrent_state(recurrent_state, x, model.recurrent_state_mix)
                 if j < model.num_encoder_layers:
                     recurrent_encoder_updates[j] = x
         for j, updated_skip in recurrent_encoder_updates.items():
@@ -1644,6 +1725,8 @@ def main() -> None:
         raise ValueError(f"LEAKY_RELU_SLOPE must be >= 0, got {args.leaky_relu_slope}")
     if args.eval_stride < 0:
         raise ValueError(f"EVAL_STRIDE must be >= 0, got {args.eval_stride}")
+    if args.recurrent_depth_slots <= 0:
+        raise ValueError(f"RECURRENT_DEPTH_SLOTS must be > 0, got {args.recurrent_depth_slots}")
     if args.tokenizer_type not in {"bpe", "sp"}:
         raise ValueError(f"TOKENIZER_TYPE must be 'bpe' or 'sp', got {args.tokenizer_type}")
     if args.sdclip_coef < 0.0:
@@ -1805,6 +1888,9 @@ def main() -> None:
         recurrent_layer_start=args.recurrent_layer_start,
         recurrent_layer_end=args.recurrent_layer_end,
         recurrent_loops=args.recurrent_loops,
+        recurrent_depth_conditioning=args.recurrent_depth_conditioning,
+        recurrent_depth_slots=args.recurrent_depth_slots,
+        recurrent_state_accum=args.recurrent_state_accum,
         parallel_residual_start=effective_parallel_residual_start,
         attn_scale_init=args.attn_scale_init,
         mlp_scale_init=args.mlp_scale_init,
@@ -1892,6 +1978,16 @@ def main() -> None:
     recurrent_layers = list(range(args.recurrent_layer_start, args.recurrent_layer_end)) if args.recurrent_loops > 0 else []
     log0(f"parallel_residual_layers encoder:{encoder_parallel_layers} decoder:{decoder_parallel_layers}")
     log0(f"recurrent_layers:{recurrent_layers}")
+    log0(f"recurrent_loop_count:{args.recurrent_loops}")
+    if base_model.recurrent_depth_cond is not None:
+        log0(f"recurrence_depth_conditioning:enabled slots:{args.recurrent_depth_slots}")
+    else:
+        log0("recurrence_depth_conditioning:disabled")
+    if base_model.recurrent_state_mix is not None:
+        log0("recurrent_state_accumulation:enabled init:entry_x inject:pre_block update:post_block")
+    else:
+        log0("recurrent_state_accumulation:disabled")
+    log0(f"recurrent_feature_params:{base_model.recurrence_extra_param_count()}")
     log0(f"ema:enabled decay:{args.ema_decay} use_for_eval:{int(args.use_ema_for_eval)}")
     log0(f"eval_stride:{args.eval_stride}")
     log0(
