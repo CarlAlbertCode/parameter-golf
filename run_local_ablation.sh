@@ -2,7 +2,7 @@
 set -euo pipefail
 
 if [ $# -lt 1 ]; then
-  echo "Usage: $0 {control|recur_600|depthcond|depthcond_600|stateaccum|parallel7|depthcond_parallel7|depthcond_loops2|depthcond_span245|depthcond_span356}"
+  echo "Usage: $0 {control|recur_600|warmdown200_600|qk15_600|qk15_lrclip_600|qk15_lrclip_muon985_600|depthcond|depthcond_600|stateaccum|parallel7|depthcond_parallel7|depthcond_loops2|depthcond_span245|depthcond_span356}"
   exit 1
 fi
 
@@ -71,6 +71,58 @@ case "$ABLATION" in
       PARALLEL_RESIDUAL_START=9
       ITERATIONS=600
       WARMDOWN_ITERS=600
+    )
+    ;;
+  warmdown200_600)
+    RUN_ID=sp4096_recur_warmdown200_600
+    EXTRA_ENV=(
+      RECURRENT_DEPTH_CONDITIONING=0
+      RECURRENT_STATE_ACCUM=0
+      PARALLEL_RESIDUAL_START=9
+      ITERATIONS=600
+      WARMDOWN_ITERS=200
+    )
+    ;;
+  qk15_600)
+    RUN_ID=sp4096_recur_qk15_600
+    EXTRA_ENV=(
+      RECURRENT_DEPTH_CONDITIONING=0
+      RECURRENT_STATE_ACCUM=0
+      PARALLEL_RESIDUAL_START=9
+      ITERATIONS=600
+      WARMDOWN_ITERS=600
+      QK_GAIN=1.5
+    )
+    ;;
+  qk15_lrclip_600)
+    RUN_ID=sp4096_recur_qk15_lrclip_600
+    EXTRA_ENV=(
+      RECURRENT_DEPTH_CONDITIONING=0
+      RECURRENT_STATE_ACCUM=0
+      PARALLEL_RESIDUAL_START=9
+      ITERATIONS=600
+      WARMDOWN_ITERS=600
+      QK_GAIN=1.5
+      SDCLIP_COEF=2.0
+      TIED_EMBED_LR=0.045
+      MATRIX_LR=0.038
+      SCALAR_LR=0.038
+    )
+    ;;
+  qk15_lrclip_muon985_600)
+    RUN_ID=sp4096_recur_qk15_lrclip_muon985_600
+    EXTRA_ENV=(
+      RECURRENT_DEPTH_CONDITIONING=0
+      RECURRENT_STATE_ACCUM=0
+      PARALLEL_RESIDUAL_START=9
+      ITERATIONS=600
+      WARMDOWN_ITERS=600
+      QK_GAIN=1.5
+      SDCLIP_COEF=2.0
+      TIED_EMBED_LR=0.045
+      MATRIX_LR=0.038
+      SCALAR_LR=0.038
+      MUON_MOMENTUM=0.985
     )
     ;;
   depthcond)
@@ -147,7 +199,7 @@ case "$ABLATION" in
     ;;
   *)
     echo "Unknown ablation: $ABLATION"
-    echo "Valid: control recur_600 depthcond depthcond_600 stateaccum parallel7 depthcond_parallel7 depthcond_loops2 depthcond_span245 depthcond_span356"
+    echo "Valid: control recur_600 warmdown200_600 qk15_600 qk15_lrclip_600 qk15_lrclip_muon985_600 depthcond depthcond_600 stateaccum parallel7 depthcond_parallel7 depthcond_loops2 depthcond_span245 depthcond_span356"
     exit 1
     ;;
 esac
