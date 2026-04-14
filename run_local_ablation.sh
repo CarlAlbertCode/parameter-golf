@@ -2,7 +2,7 @@
 set -euo pipefail
 
 if [ $# -lt 1 ]; then
-  echo "Usage: $0 {control|depthcond|stateaccum|parallel7|depthcond_parallel7|depthcond_loops2|depthcond_span245|depthcond_span356}"
+  echo "Usage: $0 {control|recur_600|depthcond|depthcond_600|stateaccum|parallel7|depthcond_parallel7|depthcond_loops2|depthcond_span245|depthcond_span356}"
   exit 1
 fi
 
@@ -63,12 +63,32 @@ case "$ABLATION" in
       PARALLEL_RESIDUAL_START=9
     )
     ;;
+  recur_600)
+    RUN_ID=sp4096_recur_600
+    EXTRA_ENV=(
+      RECURRENT_DEPTH_CONDITIONING=0
+      RECURRENT_STATE_ACCUM=0
+      PARALLEL_RESIDUAL_START=9
+      ITERATIONS=600
+      WARMDOWN_ITERS=600
+    )
+    ;;
   depthcond)
     RUN_ID=sp4096_recur_depthcond_400
     EXTRA_ENV=(
       RECURRENT_DEPTH_CONDITIONING=1
       RECURRENT_STATE_ACCUM=0
       PARALLEL_RESIDUAL_START=9
+    )
+    ;;
+  depthcond_600)
+    RUN_ID=sp4096_recur_depthcond_600
+    EXTRA_ENV=(
+      RECURRENT_DEPTH_CONDITIONING=1
+      RECURRENT_STATE_ACCUM=0
+      PARALLEL_RESIDUAL_START=9
+      ITERATIONS=600
+      WARMDOWN_ITERS=600
     )
     ;;
   stateaccum)
@@ -127,7 +147,7 @@ case "$ABLATION" in
     ;;
   *)
     echo "Unknown ablation: $ABLATION"
-    echo "Valid: control depthcond stateaccum parallel7 depthcond_parallel7 depthcond_loops2 depthcond_span245 depthcond_span356"
+    echo "Valid: control recur_600 depthcond depthcond_600 stateaccum parallel7 depthcond_parallel7 depthcond_loops2 depthcond_span245 depthcond_span356"
     exit 1
     ;;
 esac
