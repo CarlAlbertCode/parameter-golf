@@ -100,6 +100,7 @@ class Hyperparameters:
     mlp_mult = int(os.environ.get("MLP_MULT", 2))
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
+    rope_dims = int(os.environ.get("ROPE_DIMS", 0))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
 
     # Optimizer hyperparameters.
@@ -1040,9 +1041,12 @@ def update_recurrent_state(
 
 class Rotary(nn.Module):
     # Caches cos/sin tables per sequence length on the current device.
-    def __init__(self, dim: int, base: float = 10000.0):
+    def __init__(self, dim: int, base: float = 10000.0, rope_dims: int = 0):
         super().__init__()
-        inv_freq = 1.0 / (base ** (torch.arange(0, dim, 2, dtype=torch.float32) / dim))
+        self.rope_dims = rope_dims if rope_dims > 0 else dim
+        inv_freq = 1.0 / (
+            base ** (torch.arange(0, self.rope_dims, 2, dtype=torch.float32) / self.rope_dims)
+        )
         self.register_buffer("inv_freq", inv_freq, persistent=False)
         self._seq_len_cached = 0
         self._cos_cached: Tensor | None = None
@@ -1065,9 +1069,17 @@ class Rotary(nn.Module):
 
 
 def apply_rotary_emb(x: Tensor, cos: Tensor, sin: Tensor) -> Tensor:
-    half = x.size(-1) // 2
-    x1, x2 = x[..., :half], x[..., half:]
-    return torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
+    rope_dims = cos.size(-1) * 2
+    if rope_dims == x.size(-1):
+        half = rope_dims // 2
+        x1, x2 = x[..., :half], x[..., half:]
+        return torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
+    x_rope = x[..., :rope_dims]
+    x_pass = x[..., rope_dims:]
+    half = rope_dims // 2
+    x1, x2 = x_rope[..., :half], x_rope[..., half:]
+    x_rot = torch.cat((x1 * cos + x2 * sin, x1 * (-sin) + x2 * cos), dim=-1)
+    return torch.cat((x_rot, x_pass), dim=-1)
 
 
 class CausalSelfAttention(nn.Module):
@@ -1077,6 +1089,7 @@ class CausalSelfAttention(nn.Module):
         num_heads: int,
         num_kv_heads: int,
         rope_base: float,
+        rope_dims: int,
         qk_gain_init: float,
         enable_kv_adapt: bool,
     ):
@@ -1090,6 +1103,11 @@ class CausalSelfAttention(nn.Module):
         self.head_dim = dim // num_heads
         if self.head_dim % 2 != 0:
             raise ValueError("head_dim must be even for RoPE")
+        self.rope_dims = min(rope_dims, self.head_dim) if rope_dims > 0 else self.head_dim
+        if self.rope_dims % 2 != 0:
+            raise ValueError(
+                f"effective rope_dims must be even, got rope_dims={rope_dims} head_dim={self.head_dim}"
+            )
         kv_dim = self.num_kv_heads * self.head_dim
         self.c_q = CastedLinear(dim, dim, bias=False)
         self.c_k = CastedLinear(dim, kv_dim, bias=False)
@@ -1097,7 +1115,7 @@ class CausalSelfAttention(nn.Module):
         self.proj = CastedLinear(dim, dim, bias=False)
         self.proj.zero_init = True
         self.q_gain = nn.Parameter(torch.full((num_heads,), qk_gain_init, dtype=torch.float32))
-        self.rotary = Rotary(self.head_dim, base=rope_base)
+        self.rotary = Rotary(self.head_dim, base=rope_base, rope_dims=self.rope_dims)
         self.enable_kv_adapt = enable_kv_adapt
         self.kv_adapt_scale_k = 0.125
         self.kv_adapt_scale_v = 0.125
@@ -1151,6 +1169,7 @@ class Block(nn.Module):
         num_kv_heads: int,
         mlp_mult: int,
         rope_base: float,
+        rope_dims: int,
         qk_gain_init: float,
         leaky_relu_slope: float,
         attn_scale_init: float,
@@ -1160,7 +1179,15 @@ class Block(nn.Module):
         super().__init__()
         self.attn_norm = RMSNorm()
         self.mlp_norm = RMSNorm()
-        self.attn = CausalSelfAttention(dim, num_heads, num_kv_heads, rope_base, qk_gain_init, enable_kv_adapt)
+        self.attn = CausalSelfAttention(
+            dim,
+            num_heads,
+            num_kv_heads,
+            rope_base,
+            rope_dims,
+            qk_gain_init,
+            enable_kv_adapt,
+        )
         self.mlp = MLP(dim, mlp_mult, leaky_relu_slope)
         self.attn_scale = nn.Parameter(torch.full((dim,), attn_scale_init, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.full((dim,), mlp_scale_init, dtype=torch.float32))
@@ -1196,6 +1223,7 @@ class GPT(nn.Module):
         tied_embed_init_std: float,
         logit_softcap: float,
         rope_base: float,
+        rope_dims: int,
         qk_gain_init: float,
         leaky_relu_slope: float,
         bigram_vocab_size: int,
@@ -1250,6 +1278,7 @@ class GPT(nn.Module):
                     num_kv_heads,
                     mlp_mult,
                     rope_base,
+                    rope_dims,
                     qk_gain_init,
                     leaky_relu_slope,
                     attn_scale_init,
@@ -1725,6 +1754,8 @@ def main() -> None:
         raise ValueError(f"LEAKY_RELU_SLOPE must be >= 0, got {args.leaky_relu_slope}")
     if args.eval_stride < 0:
         raise ValueError(f"EVAL_STRIDE must be >= 0, got {args.eval_stride}")
+    if args.rope_dims < 0:
+        raise ValueError(f"ROPE_DIMS must be >= 0, got {args.rope_dims}")
     if args.recurrent_depth_slots <= 0:
         raise ValueError(f"RECURRENT_DEPTH_SLOTS must be > 0, got {args.recurrent_depth_slots}")
     if args.tokenizer_type not in {"bpe", "sp"}:
@@ -1881,6 +1912,7 @@ def main() -> None:
         tied_embed_init_std=args.tied_embed_init_std,
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
+        rope_dims=args.rope_dims,
         qk_gain_init=args.qk_gain_init,
         leaky_relu_slope=args.leaky_relu_slope,
         bigram_vocab_size=args.bigram_vocab_size,
@@ -1951,6 +1983,7 @@ def main() -> None:
     log0(f"world_size:{world_size} grad_accum_steps:{grad_accum_steps}")
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
+    log0(f"rope:base:{args.rope_base} dims:{get_block(base_model, 0).attn.rope_dims}/{get_block(base_model, 0).attn.head_dim}")
     if base_model.bigram is not None:
         log0(f"bigram_hash:enabled vocab_size:{args.bigram_vocab_size} dim:{args.bigram_dim}")
     else:
