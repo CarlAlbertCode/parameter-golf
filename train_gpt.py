@@ -2021,6 +2021,15 @@ def main() -> None:
     else:
         log0("recurrent_state_accumulation:disabled")
     log0(f"recurrent_feature_params:{base_model.recurrence_extra_param_count()}")
+    if args.ttt_enabled:
+        log0(
+            f"ttt:enabled chunk_tokens:{args.ttt_chunk_tokens} lr:{args.ttt_lr} "
+            f"epochs:{args.ttt_epochs} momentum:{args.ttt_momentum} "
+            f"grad_clip:{args.ttt_grad_clip} freeze_blocks:{args.ttt_freeze_blocks} "
+            f"batch_seqs:{args.ttt_batch_seqs}"
+        )
+    else:
+        log0("ttt:disabled")
     log0(f"ema:enabled decay:{args.ema_decay} use_for_eval:{int(args.use_ema_for_eval)}")
     log0(f"eval_stride:{args.eval_stride}")
     log0(

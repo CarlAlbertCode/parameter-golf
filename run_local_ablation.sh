@@ -2,7 +2,7 @@
 set -euo pipefail
 
 if [ $# -lt 1 ]; then
-  echo "Usage: $0 {control|recur_600|warmdown200_600|qk15_600|qk15_lrclip_600|qk15_lrclip_muon985_600|depthcond|depthcond_600|stateaccum|parallel7|depthcond_parallel7|depthcond_loops2|depthcond_span245|depthcond_span356}"
+  echo "Usage: $0 {control|recur_600|warmdown200_600|qk15_600|qk15_lrclip_600|qk15_lrclip_muon985_600|qk15_lrclip_muon985_rope32_ttt_600|qk15_lrclip_muon985_rope32_ttt_chunk65536_600|qk15_lrclip_muon985_rope32_ttt_freeze2_600|qk15_lrclip_muon985_rope32_ttt_ep1_lr004_600|qk15_lrclip_muon985_rope32_ttt_best_600|depthcond|depthcond_600|stateaccum|parallel7|depthcond_parallel7|depthcond_loops2|depthcond_span245|depthcond_span356}"
   exit 1
 fi
 
@@ -125,6 +125,131 @@ case "$ABLATION" in
       MUON_MOMENTUM=0.985
     )
     ;;
+  qk15_lrclip_muon985_rope32_ttt_600)
+    RUN_ID=sp4096_recur_qk15_lrclip_muon985_rope32_ttt_600
+    EXTRA_ENV=(
+      RECURRENT_DEPTH_CONDITIONING=0
+      RECURRENT_STATE_ACCUM=0
+      PARALLEL_RESIDUAL_START=9
+      ITERATIONS=600
+      WARMDOWN_ITERS=600
+      QK_GAIN=1.5
+      SDCLIP_COEF=2.0
+      TIED_EMBED_LR=0.045
+      MATRIX_LR=0.038
+      SCALAR_LR=0.038
+      MUON_MOMENTUM=0.985
+      ROPE_DIMS=32
+      TTT_ENABLED=1
+      TTT_CHUNK_TOKENS=32768
+      TTT_LR=0.002
+      TTT_EPOCHS=3
+      TTT_MOMENTUM=0.9
+      TTT_GRAD_CLIP=1.0
+      TTT_FREEZE_BLOCKS=0
+      TTT_BATCH_SEQS=32
+    )
+    ;;
+  qk15_lrclip_muon985_rope32_ttt_chunk65536_600)
+    RUN_ID=sp4096_recur_qk15_lrclip_muon985_rope32_ttt_chunk65536_600
+    EXTRA_ENV=(
+      RECURRENT_DEPTH_CONDITIONING=0
+      RECURRENT_STATE_ACCUM=0
+      PARALLEL_RESIDUAL_START=9
+      ITERATIONS=600
+      WARMDOWN_ITERS=600
+      QK_GAIN=1.5
+      SDCLIP_COEF=2.0
+      TIED_EMBED_LR=0.045
+      MATRIX_LR=0.038
+      SCALAR_LR=0.038
+      MUON_MOMENTUM=0.985
+      ROPE_DIMS=32
+      TTT_ENABLED=1
+      TTT_CHUNK_TOKENS=65536
+      TTT_LR=0.002
+      TTT_EPOCHS=3
+      TTT_MOMENTUM=0.9
+      TTT_GRAD_CLIP=1.0
+      TTT_FREEZE_BLOCKS=0
+      TTT_BATCH_SEQS=32
+    )
+    ;;
+  qk15_lrclip_muon985_rope32_ttt_freeze2_600)
+    RUN_ID=sp4096_recur_qk15_lrclip_muon985_rope32_ttt_freeze2_600
+    EXTRA_ENV=(
+      RECURRENT_DEPTH_CONDITIONING=0
+      RECURRENT_STATE_ACCUM=0
+      PARALLEL_RESIDUAL_START=9
+      ITERATIONS=600
+      WARMDOWN_ITERS=600
+      QK_GAIN=1.5
+      SDCLIP_COEF=2.0
+      TIED_EMBED_LR=0.045
+      MATRIX_LR=0.038
+      SCALAR_LR=0.038
+      MUON_MOMENTUM=0.985
+      ROPE_DIMS=32
+      TTT_ENABLED=1
+      TTT_CHUNK_TOKENS=32768
+      TTT_LR=0.002
+      TTT_EPOCHS=3
+      TTT_MOMENTUM=0.9
+      TTT_GRAD_CLIP=1.0
+      TTT_FREEZE_BLOCKS=2
+      TTT_BATCH_SEQS=32
+    )
+    ;;
+  qk15_lrclip_muon985_rope32_ttt_ep1_lr004_600)
+    RUN_ID=sp4096_recur_qk15_lrclip_muon985_rope32_ttt_ep1_lr004_600
+    EXTRA_ENV=(
+      RECURRENT_DEPTH_CONDITIONING=0
+      RECURRENT_STATE_ACCUM=0
+      PARALLEL_RESIDUAL_START=9
+      ITERATIONS=600
+      WARMDOWN_ITERS=600
+      QK_GAIN=1.5
+      SDCLIP_COEF=2.0
+      TIED_EMBED_LR=0.045
+      MATRIX_LR=0.038
+      SCALAR_LR=0.038
+      MUON_MOMENTUM=0.985
+      ROPE_DIMS=32
+      TTT_ENABLED=1
+      TTT_CHUNK_TOKENS=32768
+      TTT_LR=0.004
+      TTT_EPOCHS=1
+      TTT_MOMENTUM=0.9
+      TTT_GRAD_CLIP=1.0
+      TTT_FREEZE_BLOCKS=0
+      TTT_BATCH_SEQS=32
+    )
+    ;;
+  qk15_lrclip_muon985_rope32_ttt_best_600)
+    RUN_ID=sp4096_recur_qk15_lrclip_muon985_rope32_ttt_best_600
+    EXTRA_ENV=(
+      RECURRENT_DEPTH_CONDITIONING=0
+      RECURRENT_STATE_ACCUM=0
+      PARALLEL_RESIDUAL_START=9
+      ITERATIONS=600
+      WARMDOWN_ITERS=600
+      QK_GAIN=1.5
+      SDCLIP_COEF=2.0
+      TIED_EMBED_LR=0.045
+      MATRIX_LR=0.038
+      SCALAR_LR=0.038
+      MUON_MOMENTUM=0.985
+      ROPE_DIMS=32
+      TTT_ENABLED=1
+      TTT_CHUNK_TOKENS=65536
+      TTT_LR=0.004
+      TTT_EPOCHS=1
+      TTT_MOMENTUM=0.9
+      TTT_GRAD_CLIP=1.0
+      TTT_FREEZE_BLOCKS=2
+      TTT_BATCH_SEQS=32
+    )
+    ;;
   depthcond)
     RUN_ID=sp4096_recur_depthcond_400
     EXTRA_ENV=(
@@ -199,7 +324,7 @@ case "$ABLATION" in
     ;;
   *)
     echo "Unknown ablation: $ABLATION"
-    echo "Valid: control recur_600 warmdown200_600 qk15_600 qk15_lrclip_600 qk15_lrclip_muon985_600 depthcond depthcond_600 stateaccum parallel7 depthcond_parallel7 depthcond_loops2 depthcond_span245 depthcond_span356"
+    echo "Valid: control recur_600 warmdown200_600 qk15_600 qk15_lrclip_600 qk15_lrclip_muon985_600 qk15_lrclip_muon985_rope32_ttt_600 qk15_lrclip_muon985_rope32_ttt_chunk65536_600 qk15_lrclip_muon985_rope32_ttt_freeze2_600 qk15_lrclip_muon985_rope32_ttt_ep1_lr004_600 qk15_lrclip_muon985_rope32_ttt_best_600 depthcond depthcond_600 stateaccum parallel7 depthcond_parallel7 depthcond_loops2 depthcond_span245 depthcond_span356"
     exit 1
     ;;
 esac
