@@ -101,6 +101,7 @@ class Hyperparameters:
     tie_embeddings = bool(int(os.environ.get("TIE_EMBEDDINGS", "1")))
     rope_base = float(os.environ.get("ROPE_BASE", 10000.0))
     rope_dims = int(os.environ.get("ROPE_DIMS", 0))
+    ln_scale = bool(int(os.environ.get("LN_SCALE", "0")))
     logit_softcap = float(os.environ.get("LOGIT_SOFTCAP", 30.0))
 
     # Optimizer hyperparameters.
@@ -1171,6 +1172,8 @@ class Block(nn.Module):
         rope_base: float,
         rope_dims: int,
         qk_gain_init: float,
+        layer_idx: int,
+        ln_scale: bool,
         leaky_relu_slope: float,
         attn_scale_init: float,
         mlp_scale_init: float,
@@ -1192,21 +1195,23 @@ class Block(nn.Module):
         self.attn_scale = nn.Parameter(torch.full((dim,), attn_scale_init, dtype=torch.float32))
         self.mlp_scale = nn.Parameter(torch.full((dim,), mlp_scale_init, dtype=torch.float32))
         self.resid_mix = nn.Parameter(torch.stack((torch.ones(dim), torch.zeros(dim))).float())
+        self.ln_scale_factor = 1.0 / math.sqrt(layer_idx + 1) if ln_scale else 1.0
 
     def forward(self, x: Tensor, x0: Tensor, parallel_residual: bool = False) -> Tensor:
         mix = self.resid_mix.to(dtype=x.dtype)
         x = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
+        s = self.ln_scale_factor
         if parallel_residual:
-            h_attn = self.attn_norm(x)
-            h_mlp = self.mlp_norm(x)
+            h_attn = self.attn_norm(x) * s
+            h_mlp = self.mlp_norm(x) * s
             attn_out = self.attn(h_attn)
             mlp_out = self.mlp(h_mlp)
             x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
             x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * mlp_out
             return x
-        attn_out = self.attn(self.attn_norm(x))
+        attn_out = self.attn(self.attn_norm(x) * s)
         x = x + self.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
-        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x))
+        x = x + self.mlp_scale.to(dtype=x.dtype)[None, None, :] * self.mlp(self.mlp_norm(x) * s)
         return x
 
 
@@ -1224,6 +1229,7 @@ class GPT(nn.Module):
         logit_softcap: float,
         rope_base: float,
         rope_dims: int,
+        ln_scale: bool,
         qk_gain_init: float,
         leaky_relu_slope: float,
         bigram_vocab_size: int,
@@ -1280,6 +1286,8 @@ class GPT(nn.Module):
                     rope_base,
                     rope_dims,
                     qk_gain_init,
+                    i,
+                    ln_scale,
                     leaky_relu_slope,
                     attn_scale_init,
                     mlp_scale_init,
@@ -1585,14 +1593,15 @@ def block_forward_with_stats(
 ) -> tuple[Tensor, Tensor, Tensor, Tensor]:
     mix = block.resid_mix.to(dtype=x.dtype)
     x_in = mix[0][None, None, :] * x + mix[1][None, None, :] * x0
-    h_attn = block.attn_norm(x_in)
+    s = block.ln_scale_factor
+    h_attn = block.attn_norm(x_in) * s
     attn_out = block.attn(h_attn)
     x_out = x_in + block.attn_scale.to(dtype=x.dtype)[None, None, :] * attn_out
     if parallel_residual:
-        mlp_out = block.mlp(block.mlp_norm(x_in))
+        mlp_out = block.mlp(block.mlp_norm(x_in) * s)
         x_out = x_out + block.mlp_scale.to(dtype=x.dtype)[None, None, :] * mlp_out
         return x_out, x_in, attn_out, mlp_out
-    mlp_out = block.mlp(block.mlp_norm(x_out))
+    mlp_out = block.mlp(block.mlp_norm(x_out) * s)
     x_out = x_out + block.mlp_scale.to(dtype=x.dtype)[None, None, :] * mlp_out
     return x_out, x_in, attn_out, mlp_out
 
@@ -1913,6 +1922,7 @@ def main() -> None:
         logit_softcap=args.logit_softcap,
         rope_base=args.rope_base,
         rope_dims=args.rope_dims,
+        ln_scale=args.ln_scale,
         qk_gain_init=args.qk_gain_init,
         leaky_relu_slope=args.leaky_relu_slope,
         bigram_vocab_size=args.bigram_vocab_size,
@@ -1984,6 +1994,13 @@ def main() -> None:
     log0("sdp_backends:cudnn=False flash=True mem_efficient=False math=False")
     log0(f"attention_mode:gqa num_heads:{args.num_heads} num_kv_heads:{args.num_kv_heads}")
     log0(f"rope:base:{args.rope_base} dims:{get_block(base_model, 0).attn.rope_dims}/{get_block(base_model, 0).attn.head_dim}")
+    if args.ln_scale:
+        log0(
+            f"ln_scale:enabled first:{get_block(base_model, 0).ln_scale_factor:.4f} "
+            f"last:{get_block(base_model, len(base_model.blocks) - 1).ln_scale_factor:.4f}"
+        )
+    else:
+        log0("ln_scale:disabled")
     if base_model.bigram is not None:
         log0(f"bigram_hash:enabled vocab_size:{args.bigram_vocab_size} dim:{args.bigram_dim}")
     else:
