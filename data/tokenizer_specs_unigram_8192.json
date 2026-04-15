@@ -1,0 +1,16 @@
+{
+  "tokenizers": [
+    {
+      "name": "sp_unigram_8192",
+      "kind": "sentencepiece_unigram",
+      "model_type": "unigram",
+      "dataset_suffix": "sp8192_unigram",
+      "model_prefix": "fineweb_unigram_8192",
+      "vocab_size": 8192,
+      "trainer_overrides": {
+        "normalization_rule_name": "nfkc",
+        "byte_fallback": true
+      }
+    }
+  ]
+}

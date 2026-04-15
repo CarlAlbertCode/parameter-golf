@@ -195,14 +195,20 @@ def tokenizer_kind(spec: dict[str, Any]) -> str:
         return "byte"
     if kind in {"sentencepiece_bpe", "sentencepiece"}:
         return "sentencepiece_bpe"
+    if kind in {"sentencepiece_unigram"}:
+        return "sentencepiece_unigram"
     builder = str(spec.get("builder", ""))
     builder_name = builder.rsplit(":", 1)[-1]
     if builder_name == "build_pure_byte_tokenizer":
         return "byte"
     if builder_name == "build_sentencepiece_tokenizer":
         return "sentencepiece_bpe"
+    if builder_name == "build_sentencepiece_unigram_tokenizer":
+        return "sentencepiece_unigram"
     if spec.get("dataset_suffix") == "byte260":
         return "byte"
+    if spec.get("model_type") == "unigram":
+        return "sentencepiece_unigram"
     if "vocab_size" in spec:
         return "sentencepiece_bpe"
     raise ValueError(
@@ -252,7 +258,11 @@ def build_sentencepiece_tokenizer(*, spec: dict[str, Any], docs_jsonl: Path, tok
         raise RuntimeError("sentencepiece is required for SentencePiece tokenizer exports") from exc
 
     vocab_size = int(spec["vocab_size"])
-    prefix = tokenizers_dir / spec.get("model_prefix", f"fineweb_{vocab_size}_bpe")
+    model_type = str(spec.get("model_type", "bpe"))
+    if model_type not in {"bpe", "unigram"}:
+        raise ValueError(f"unsupported SentencePiece model_type={model_type!r}")
+    default_prefix = f"fineweb_{vocab_size}_{model_type}"
+    prefix = tokenizers_dir / spec.get("model_prefix", default_prefix)
     model_path = prefix.with_suffix(".model")
     vocab_path = prefix.with_suffix(".vocab")
     prefix.parent.mkdir(parents=True, exist_ok=True)
@@ -276,12 +286,12 @@ def build_sentencepiece_tokenizer(*, spec: dict[str, Any], docs_jsonl: Path, tok
                 max_docs=None if spec.get("tokenizer_train_docs") is None else int(spec["tokenizer_train_docs"]),
             ),
             "model_prefix": str(prefix),
-            "model_type": "bpe",
+            "model_type": model_type,
             "vocab_size": vocab_size,
             "character_coverage": 0.999,
             "byte_fallback": True,
             "split_digits": True,
-            "normalization_rule_name": "nmt_nfkc",
+            "normalization_rule_name": "nmt_nfkc" if model_type == "bpe" else "nfkc",
             "add_dummy_prefix": False,
             "pad_id": 0,
             "bos_id": 1,
@@ -293,16 +303,19 @@ def build_sentencepiece_tokenizer(*, spec: dict[str, Any], docs_jsonl: Path, tok
         spm.SentencePieceTrainer.train(**kwargs)
 
     tok = spm.SentencePieceProcessor(model_file=str(model_path))
+    kind = "sentencepiece_unigram" if model_type == "unigram" else "sentencepiece_bpe"
+    default_name = f"sp_{model_type}_{vocab_size}"
+    default_suffix = f"sp{vocab_size}_{model_type}"
     return {
-        "name": spec.get("name", f"sp_bpe_{vocab_size}"),
-        "kind": "sentencepiece_bpe",
-        "dataset_suffix": spec.get("dataset_suffix", f"sp{vocab_size}"),
+        "name": spec.get("name", default_name),
+        "kind": kind,
+        "dataset_suffix": spec.get("dataset_suffix", default_suffix),
         "vocab_size": int(tok.vocab_size()),
         "bos_id": int(tok.bos_id()),
         "eos_id": int(tok.eos_id()),
         "encode": lambda text, tok=tok: tok.encode(text, out_type=int),
         "encode_batch": lambda texts, tok=tok: tok.encode(texts, out_type=int, num_threads=TOKENIZER_THREADS),
-        "manifest": {"model_path": str(model_path), "vocab_path": str(vocab_path)},
+        "manifest": {"model_path": str(model_path), "vocab_path": str(vocab_path), "model_type": model_type},
     }
 
 
@@ -414,7 +427,7 @@ def build_tokenizers(
         kind = tokenizer_kind(spec)
         if skip_byte and kind == "byte":
             continue
-        if kind == "sentencepiece_bpe":
+        if kind in {"sentencepiece_bpe", "sentencepiece_unigram"}:
             if tokenizer_train_docs is not None:
                 spec["tokenizer_train_docs"] = int(tokenizer_train_docs)
             vocab_size = int(spec["vocab_size"])
